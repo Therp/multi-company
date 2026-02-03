@@ -91,16 +91,41 @@ class StockPicking(models.Model):
             dest_picking = self.intercompany_picking_id.with_user(
                 intercompany_user
             ).with_company(dest_company)
+
+            def _get_intercompany_po_move(src_move):
+                """Get destination PO move for this delivery move
+                (SO-PO link, else product fallback)"""
+                StockMove = self.env["stock.move"]
+                po_move = StockMove
+                sale_line = src_move.sale_line_id
+                po_line = sale_line.auto_purchase_line_id if sale_line else False
+                if po_line:
+                    po_move = po_line.move_ids.filtered(
+                        lambda m, ic_pick=dest_picking: m.picking_id == ic_pick
+                        and m.state not in ["done", "cancel"]
+                    )[:1]
+                if not po_move:
+                    candidates = dest_picking.move_ids.filtered(
+                        lambda m: m.product_id == src_move.product_id
+                        and m.state not in ["done", "cancel"]
+                    )
+                    if len(candidates) > 1:
+                        raise UserError(
+                            _(
+                                "Multiple candidate receipt moves found for product "
+                                "%(product)s in picking %(pick)s."
+                            )
+                            % {
+                                "product": src_move.product_id.display_name,
+                                "pick": dest_picking.name,
+                            }
+                        )
+                    po_move = candidates[:1]
+                return po_move
+
             for move in self.move_ids:
                 move_lines = move.move_line_ids.filtered(lambda x: x.quantity > 0)
-                # To identify the correct move to write to,
-                # use both the SO-PO link and the intercompany_picking_id link
-                po_move_pending = (
-                    move.sale_line_id.auto_purchase_line_id.move_ids.filtered(
-                        lambda x, ic_pick=dest_picking: x.picking_id == ic_pick
-                        and x.state not in ["done", "cancel"]
-                    )
-                )
+                po_move_pending = _get_intercompany_po_move(move)
                 po_move_lines = po_move_pending.move_line_ids
                 # Don’t raise an error
                 # if there are no move_line_ids and the location is transit.
@@ -108,7 +133,7 @@ class StockPicking(models.Model):
                 # but in transit locations,
                 # we need to create the move lines to assign lots/serials.
                 if not po_move_pending or (
-                    po_move_lines and move.location_dest_id.usage != "transit"
+                    not po_move_lines and move.location_dest_id.usage != "transit"
                 ):
                     raise UserError(
                         _(

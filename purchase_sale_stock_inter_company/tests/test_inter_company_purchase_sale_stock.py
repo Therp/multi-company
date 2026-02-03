@@ -822,3 +822,118 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
             so_lots, po_lots, msg="The lots of the moves should be the same"
         )
         self.assertFalse(so_lots.company_id, msg="Lots should not have a company.")
+
+    def test_sync_picking_lot_without_purchase_line_id(self):
+        """
+        Regression test:
+        On the delivery side (SO picking), stock.move.purchase_line_id may be empty.
+        Intercompany syncing must still find the destination PO move using the
+        SO-PO link (sale_line.auto_purchase_line_id) and mirror lots correctly.
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.stockable_product_serial
+        )
+        sale = self._approve_po(purchase)
+        po_picking = purchase.picking_ids
+        so_picking = sale.picking_ids
+        so_move = so_picking.move_ids
+        self.assertTrue(so_move.sale_line_id)
+        self.assertTrue(so_move.sale_line_id.auto_purchase_line_id)
+        # Reproduce the real-world issue:
+        # outgoing delivery move has no purchase_line_id set.
+        so_move.purchase_line_id = False
+        self.assertFalse(
+            so_move.purchase_line_id,
+        )
+        # Set serial move lines and validate the SO picking
+        so_move.move_line_ids = [
+            Command.clear(),
+            Command.create(
+                {
+                    "location_id": so_move.location_id.id,
+                    "location_dest_id": so_move.location_dest_id.id,
+                    "product_id": self.stockable_product_serial.id,
+                    "product_uom_id": self.stockable_product_serial.uom_id.id,
+                    "quantity": 1,
+                    "lot_id": self.serial_1.id,
+                    "picking_id": so_picking.id,
+                },
+            ),
+            Command.create(
+                {
+                    "location_id": so_move.location_id.id,
+                    "location_dest_id": so_move.location_dest_id.id,
+                    "product_id": self.stockable_product_serial.id,
+                    "product_uom_id": self.stockable_product_serial.uom_id.id,
+                    "quantity": 1,
+                    "lot_id": self.serial_2.id,
+                    "picking_id": so_picking.id,
+                },
+            ),
+        ]
+        so_picking.with_company(so_picking.company_id).action_confirm()
+        so_picking.with_company(so_picking.company_id).action_assign()
+        so_picking.with_user(self.user_company_b).button_validate()
+        self.assertEqual(so_picking.state, "done")
+        so_lots = so_move.mapped("move_line_ids.lot_id")
+        po_lots = po_picking.mapped("move_ids.move_line_ids.lot_id")
+        # lots are mirrored 1:1
+        self.assertEqual(
+            len(so_lots),
+            len(po_lots),
+        )
+        self.assertEqual(
+            so_lots,
+            po_lots,
+        )
+        self.assertEqual(
+            so_lots.mapped("name"),
+            po_lots.mapped("name"),
+        )
+
+    def test_sync_picking_multiple_po_moves_raises(self):
+        """
+        Safeguard test
+        the  product-based fallback finds multiple destination receipt moves,
+        we must raise a clear UserError
+        This protects cases where the destination picking contains duplicate
+        receipt moves for the same product.
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.consumable_product
+        )
+        # Duplicate same product line
+        purchase.order_line += purchase.order_line.copy({"product_qty": 1})
+        sale = self._approve_po(purchase)
+        po_picking = purchase.picking_ids
+        so_picking = sale.picking_ids
+        so_move = so_picking.move_ids[:1]
+        self.assertTrue(so_move)
+        # Force to use the product-based fallback.
+        # remove the SO->PO link so _get_intercompany_po_move() can't use it.
+        sale_line = so_move.sale_line_id
+        self.assertTrue(sale_line)
+        sale_line.auto_purchase_line_id = False
+        self.assertFalse(
+            sale_line.auto_purchase_line_id,
+        )
+        # Ensure there are indeed multiple candidate receipt moves for the same product
+        candidates = po_picking.move_ids.filtered(
+            lambda m: m.product_id == so_move.product_id
+            and m.state not in ["done", "cancel"]
+        )
+        self.assertTrue(
+            len(candidates) > 1,
+        )
+        # Set done qty so validation actually tries to sync
+        for move in so_picking.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        with self.assertRaisesRegex(
+            UserError, "Multiple candidate receipt moves found"
+        ):
+            so_picking.with_user(self.user_company_b).button_validate()
