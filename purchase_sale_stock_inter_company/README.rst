@@ -1,7 +1,3 @@
-.. image:: https://odoo-community.org/readme-banner-image
-   :target: https://odoo-community.org/get-involved?utm_source=readme
-   :alt: Odoo Community Association
-
 ==============================================================
 Inter Company Module for Purchase to Sale Order with warehouse
 ==============================================================
@@ -17,7 +13,7 @@ Inter Company Module for Purchase to Sale Order with warehouse
 .. |badge1| image:: https://img.shields.io/badge/maturity-Beta-yellow.png
     :target: https://odoo-community.org/page/development-status
     :alt: Beta
-.. |badge2| image:: https://img.shields.io/badge/license-AGPL--3-blue.png
+.. |badge2| image:: https://img.shields.io/badge/licence-AGPL--3-blue.png
     :target: http://www.gnu.org/licenses/agpl-3.0-standalone.html
     :alt: License: AGPL-3
 .. |badge3| image:: https://img.shields.io/badge/github-OCA%2Fmulti--company-lightgray.png?logo=github
@@ -52,6 +48,31 @@ When Company A sends a product tracked by lot or serial number, a new
 lot/serial number with the same name is created in Company B to match
 it, if one doesn't already exist.
 
+In addition to the existing behavior, this module has been improved to
+better support real-world inter-company stock flows:
+
+Partial deliveries and backorders are now mirrored correctly between
+companies. When a Delivery Order is partially validated on the Sale
+Order side, the corresponding Purchase Order receipt will:
+
+-receive only the delivered quantity,
+
+-create a matching backorder receipt for the remaining quantity,
+
+-and keep both sides aligned throughout the process.
+
+Deterministic linking between Sale and Purchase pickings. Each
+inter-company Delivery Order is now explicitly linked to exactly one
+corresponding Purchase Order receipt via intercompany_picking_id. This
+avoids incorrect behavior where multiple Purchase receipts could be
+updated by a single Delivery Order in partial or backorder scenarios.
+
+Improved robustness when delivery moves are not directly linked to
+purchase lines. In some flows, delivery moves may not carry a
+purchase_line_id. The synchronization logic now reliably falls back to
+the Sale-to-Purchase line link to identify the correct destination
+receipt move.
+
 **Table of contents**
 
 .. contents::
@@ -77,10 +98,12 @@ the other company.
 Known issues / Roadmap
 ======================
 
-- Module is not very robust in complex situations, such as multi-step
-  receipts and multi-step deliveries, with backorders. Multi-step
-  receipts could be improved further.
-- This module does not sync packages.
+-  Module is not very robust in complex situations, such as multi-step
+   receipts and multi-step deliveries. Partial deliveries and backorders
+   are supported and synchronized between companies, but multi-step
+   receipts and multi-step deliveries could still be improved further.
+
+-  This module does not sync packages.
 
 Bug Tracker
 ===========
@@ -104,35 +127,39 @@ Authors
 Contributors
 ------------
 
-- Adria Gil Sorribes <adria.gil@forgeflow.com>
-- \`Akretion <https://www.akretion.com>\`:
+-  Adria Gil Sorribes <adria.gil@forgeflow.com>
+-  \`Akretion <https://www.akretion.com>\`:
 
-  - Chafique Delli <chafique.delli@akretion.com>
-  - Pierrick Brun <pierrick.brun@akretion.com>
+   -  Chafique Delli <chafique.delli@akretion.com>
+   -  Pierrick Brun <pierrick.brun@akretion.com>
 
-- \`Tecnativa <https://www.tecnativa.com>\`:
+-  \`Tecnativa <https://www.tecnativa.com>\`:
 
-  - Pedro M. Baeza
-  - Carlos Lopez
+   -  Pedro M. Baeza
+   -  Carlos Lopez
 
-- \`Camptocamp <https://www.camptocamp.com>\`:
+-  \`Camptocamp <https://www.camptocamp.com>\`:
 
-  - Maksym Yankin <maksym.yankin@camptocamp.com>
+   -  Maksym Yankin <maksym.yankin@camptocamp.com>
 
-- `PyTech SRL <info@pytech.it>`__:
+-  `PyTech SRL <info@pytech.it>`__:
 
-  - Alessandro Uffreduzzi <alessandro.uffreduzzi@pytech.it>
+   -  Alessandro Uffreduzzi <alessandro.uffreduzzi@pytech.it>
 
-- Ooops404 <info@ooops404.com>
+-  Ooops404 <info@ooops404.com>
 
-  - Francesco Foresti <francesco.foresti@ooops404.com>
+   -  Francesco Foresti <francesco.foresti@ooops404.com>
 
-- Eduard Brahas <eduardbrhas@outlook.it>
-- \`Komit
-  <`https://komit-consulting.com\\>\\\` <https://komit-consulting.com\>\`>`__:
+-  Eduard Brahas <eduardbrhas@outlook.it>
+-  \`Komit
+   <`https://komit-consulting.com\\>\\\` <https://komit-consulting.com\>\`>`__:
 
-  - Cuong Nguyen Mtm <cuong.nmtm@komit-consulting.com>
-  - Nam TNT <nam-tnt@komit-consulting.com>
+   -  Cuong Nguyen Mtm <cuong.nmtm@komit-consulting.com>
+   -  Nam TNT <nam-tnt@komit-consulting.com>
+
+-  \`Therp BV <https://www.therp.nl>\`:
+
+   -  Nikos Tsirintanis <ntsirintanis@therp.nl>
 
 Maintainers
 -----------

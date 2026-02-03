@@ -77,7 +77,7 @@ class StockPicking(models.Model):
         res = {product: quantity}
         return res
 
-    def _action_done_intercompany_actions(self, purchase):
+    def _action_done_intercompany_actions(self, purchase):  # noqa: C901
         self.ensure_one()
         try:
             dest_company = purchase.company_id
@@ -85,12 +85,35 @@ class StockPicking(models.Model):
             po_picking_pending = purchase.picking_ids.filtered(
                 lambda x: x.state not in ["done", "cancel"]
             )
-            po_picking_pending.intercompany_picking_id = self.id
-            if not self.intercompany_picking_id and po_picking_pending:
-                self.intercompany_picking_id = po_picking_pending[0]
-            dest_picking = self.intercompany_picking_id.with_user(
-                intercompany_user
-            ).with_company(dest_company)
+            dest_pick = self.browse()
+            # Choose a single destination picking for this source picking
+            # Partial deliveries create PO backorders, so a single
+            # PO can have multiple open receipts.
+            # We must select ONE destination receipt picking
+            # to mirror into for THIS SO picking:
+            # - prefer a PO receipt that is not yet linked -
+            #  intercompany_picking_id not set),
+            # - fallback to the first pending receipt if all are linked.
+            if self.intercompany_picking_id:
+                dest_pick = self.intercompany_picking_id
+            else:
+                dest_pick = (
+                    po_picking_pending.filtered(
+                        lambda p: not p.intercompany_picking_id
+                    )[:1]
+                    or po_picking_pending[:1]
+                )
+                # Set the chosen PO receipt on the source picking so syncs will be
+                # targeting the same destination picking.
+                self.intercompany_picking_id = (
+                    dest_pick if dest_pick else self.intercompany_picking_id
+                )
+            if dest_pick:
+                # Link the chosen PO receipt back to this SO picking.
+                dest_pick.intercompany_picking_id = self.id
+            dest_picking = dest_pick.with_user(intercompany_user).with_company(
+                dest_company
+            )
 
             def _get_intercompany_po_move(src_move):
                 """Get destination PO move for this delivery move

@@ -937,3 +937,81 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
             UserError, "Multiple candidate receipt moves found"
         ):
             so_picking.with_user(self.user_company_b).button_validate()
+
+    def test_sync_picking_partial_delivery_backorder(self):
+        """
+        Regression test (partial deliveries/backorders)
+        When the SO delivery is partially validated (creating a backorder),
+        the PO receipt must mirror the same partial quantity and create a matching
+        backorder receipt on the PO side (ΝΟΤ receive everything at once).
+        Then, validating the SO backorder must complete the PO receipt quantities.
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        self.consumable_product.type = "consu"
+        self.partner_company_b.company_id = False
+        # Create PO with qty 10 in company A (destination)
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.consumable_product
+        )
+        purchase.order_line.product_qty = 10.0
+        # Approve, creates SO in source, company B
+        sale = self._approve_po(purchase)
+        # We expect one SO picking initially
+        so_picking = sale.picking_ids
+        self.assertEqual(len(so_picking), 1)
+        so_picking = so_picking[0]
+        # PO picking exists and should be waiting until sync
+        self.assertTrue(purchase.picking_ids)
+        self.assertEqual(purchase.picking_ids.state, "waiting")
+        # validate SO picking partially and get a backorder
+        so_picking.with_company(so_picking.company_id).action_confirm()
+        so_picking.move_ids.quantity = 5.0
+        so_picking.move_ids.picked = True
+        res = so_picking.with_user(self.user_company_b).button_validate()
+        # A backorder wizard is hidden in res
+        wiz = (
+            self.env["stock.backorder.confirmation"]
+            .with_context(**res["context"])
+            .create({})
+        )
+        wiz.process()
+        dest_pick = so_picking.intercompany_picking_id
+        self.assertTrue(dest_pick)
+        self.assertEqual(
+            dest_pick.intercompany_picking_id,
+            so_picking,
+        )
+        # The PO receipt we mirrored into must be linked back to this SO picking.
+        self.assertEqual(dest_pick.intercompany_picking_id, so_picking)
+        # After partial validation:
+        # - PO should now have 2 receipts (done + waiting)
+        # - received qty should be 5
+        self.assertEqual(purchase.order_line.qty_received, 5.0)
+        self.assertEqual(len(purchase.picking_ids), 2)
+        po_done = purchase.picking_ids.filtered(lambda p: p.state == "done")
+        po_open = purchase.picking_ids.filtered(lambda p: p.state == "waiting")
+        self.assertEqual(len(po_done), 1)
+        self.assertEqual(len(po_open), 1)
+        # The mirrored picking is the one that got done by the partial delivery.
+        self.assertEqual(dest_pick, po_done)
+        # link is stable
+        self.assertEqual(so_picking.intercompany_picking_id, po_done)
+        self.assertEqual(po_done.intercompany_picking_id, so_picking)
+        # Quantities on PO side should split as 5 + 5
+        self.assertEqual(po_done.move_line_ids.quantity, 5.0)
+        self.assertEqual(po_open.move_line_ids.quantity, 5.0)
+        # validate the SO backorder for remaining qty 5
+        so_backorder = sale.picking_ids.filtered(lambda p: p.state != "done")
+        self.assertEqual(len(so_backorder), 1)
+        so_backorder = so_backorder[0]
+        so_backorder.with_company(so_backorder.company_id).action_confirm()
+        so_backorder.move_ids.quantity = 5.0
+        so_backorder.move_ids.picked = True
+        so_backorder.with_user(self.user_company_b).button_validate()
+        # PO fully received and both PO pickings done -  TRIUMPH
+        self.assertEqual(purchase.order_line.qty_received, 10.0)
+        self.assertTrue(all(p.state == "done" for p in purchase.picking_ids))
+        self.assertEqual(
+            sorted(purchase.picking_ids.mapped("move_line_ids.quantity")), [5.0, 5.0]
+        )
