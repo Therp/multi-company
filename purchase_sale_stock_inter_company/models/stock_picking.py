@@ -1,9 +1,12 @@
 # Copyright 2018 Tecnativa - Carlos Dauden
 # Copyright 2018 Tecnativa - Pedro M. Baeza
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
+import logging
 
 from odoo import SUPERUSER_ID, _, api, fields, models
 from odoo.exceptions import UserError
+
+_logger = logging.getLogger(__name__)
 
 
 class StockPicking(models.Model):
@@ -33,7 +36,6 @@ class StockPicking(models.Model):
                     picking.state = "waiting"
                 else:
                     picking.state = picking.intercompany_picking_id.state
-
         return res
 
     def button_validate(self):
@@ -75,10 +77,29 @@ class StockPicking(models.Model):
         # already linked, do not link again
         if self.intercompany_picking_id:
             return False
-        origin_pickings = self.move_ids.mapped("origin_returned_move_id.picking_id")
         # Mirror if a single origin exists. If multiple, then problem
-        all_intercompany_origins = origin_pickings.filtered("intercompany_picking_id")
-        return bool(all_intercompany_origins) and len(all_intercompany_origins) == 1
+        return bool(self._get_intercompany_return_origin_picking())
+
+    def _get_intercompany_return_origin_picking(self):
+        """
+        Return the single origin picking that makes this return an intercompany return.
+        A return picking may include moves that originate from multiple pickings.
+        We only mirror when we can identify exactly ONE intercompany origin picking,
+        i.e., exactly one origin picking has intercompany_picking_id set.
+        """
+        self.ensure_one()
+        origin_pickings = self.move_ids.mapped("origin_returned_move_id.picking_id")
+        intercompany_origins = origin_pickings.filtered("intercompany_picking_id")
+        if len(intercompany_origins) != 1:
+            if intercompany_origins:
+                _logger.warning(
+                    "Intercompany return mirroring skipped for picking %s: "
+                    "multiple intercompany origin pickings found: %s",
+                    self.name,
+                    ", ".join(intercompany_origins.mapped("name")),
+                )
+            return self.browse()
+        return intercompany_origins
 
     def _mirror_intercompany_return(self):
         """
@@ -91,12 +112,23 @@ class StockPicking(models.Model):
         if self.intercompany_picking_id:
             return
         # Find original picking being returned
-        origin_pickings = self.move_ids.mapped("origin_returned_move_id.picking_id")
-        # super rare case for multiple origin pickings
-        if len(origin_pickings.filtered("intercompany_picking_id")) != 1:
-            return  # TODO: silently?
-        origin_picking = origin_pickings
-        if not origin_picking or not origin_picking.intercompany_picking_id:
+        origin_picking = self._get_intercompany_return_origin_picking()
+        if not origin_picking:
+            return
+        # if destination already has a return linked back to us, do nothing.
+        existing_dest = self.env["stock.picking"].search(
+            [("intercompany_picking_id", "=", self.id)],
+            limit=1,
+        )
+        if existing_dest:
+            _logger.info(
+                "Intercompany return already mirrored for picking %s -> %s",
+                self.name,
+                existing_dest.name,
+            )
+            self.intercompany_picking_id = existing_dest
+            return
+        if not origin_picking.intercompany_picking_id:
             return
         dest_origin = origin_picking.intercompany_picking_id
         dest_company = dest_origin.company_id
@@ -112,6 +144,11 @@ class StockPicking(models.Model):
                 qty_by_product.get(move.product_id, 0.0) + qty
             )
         if not qty_by_product:
+            _logger.warning(
+                "Intercompany return mirroring skipped"
+                " for picking %s: no quantities found",
+                self.name,
+            )
             return
         # Launch return wizard on destination picking
         wiz = (

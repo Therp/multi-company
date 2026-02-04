@@ -1396,3 +1396,112 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.assertEqual(dest_return_back.intercompany_picking_id, so_return_back)
         self.assertEqual(dest_return_back.state, "done")
         self.assertEqual(sum(dest_return_back.move_ids.mapped("quantity")), 1.0)
+
+    def test_sync_picking_return_multiple_intercompany_origins_skipped(self):
+        """
+        Regression test:
+        If a single return picking contains moves originating from multiple
+        intercompany deliveries, return mirroring must be skipped
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        self.company_b.sale_auto_validation = False
+        StockMove = self.env["stock.move"]
+        # Create TWO intercompany flows
+        purchase1 = self._create_purchase_order(
+            self.partner_company_b, self.consumable_product
+        )
+        purchase2 = self._create_purchase_order(
+            self.partner_company_b, self.consumable_product
+        )
+        purchase1.order_line.product_qty = 2.0
+        purchase2.order_line.product_qty = 2.0
+        sale1 = self._approve_po(purchase1)
+        sale2 = self._approve_po(purchase2)
+        if sale1.state in ("draft", "sent"):
+            sale1.action_confirm()
+        if sale2.state in ("draft", "sent"):
+            sale2.action_confirm()
+        pick1 = sale1.picking_ids.filtered(
+            lambda p: p.picking_type_id.code == "outgoing"
+        )[:1]
+        self.assertTrue(pick1)
+        # Deliver the first intercompany picking (true origin)
+        pick1.action_confirm()
+        for move in pick1.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        pick1.with_user(self.user_company_b).button_validate()
+        self.assertEqual(pick1.state, "done")
+        self.assertTrue(pick1.intercompany_picking_id)
+        # Create a return from pick1
+        # enforce company context, otherwise Odoo may create a return
+        # in the "current" company while linking to records
+        # from another company, and _check_company() will definitely complain
+        ReturnWiz = (
+            self.env["stock.return.picking"]
+            .with_company(pick1.company_id)
+            .with_user(self.user_company_b)
+            .with_context(
+                active_id=pick1.id,
+                active_ids=pick1.ids,
+                active_model="stock.picking",
+            )
+        )
+        wiz = ReturnWiz.create({})
+        wiz.product_return_moves.quantity = 1.0
+        ret = wiz._create_return().with_company(pick1.company_id)
+        self.assertTrue(ret)
+        ret = ret[:1]
+        self.assertEqual(ret.company_id, pick1.company_id)
+        # Create a SECOND origin delivery picking in the SAME company as pick1
+        # We want another move with origin_returned_move_id in company B,
+        # but still intercompany-linked, so that _is_intercompany_return()
+        # sees multiple intercompany origins and skips mirroring.
+        pick2 = sale2.picking_ids.filtered(
+            lambda p: p.picking_type_id.code == "outgoing"
+            and p.company_id == pick1.company_id
+        )[:1]
+        self.assertTrue(pick2)
+        pick2.action_confirm()
+        for move in pick2.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        pick2.with_user(self.user_company_b).button_validate()
+        self.assertEqual(pick2.state, "done")
+        self.assertTrue(pick2.intercompany_picking_id)
+        # Inject an extra return move pointing to an origin move from pick2
+        move2 = pick2.move_ids[:1]
+        self.assertTrue(move2)
+        self.assertEqual(move2.company_id, ret.company_id)
+        # create the move in the correct company
+        StockMove.sudo().with_company(ret.company_id).create(
+            {
+                "name": move2.name,
+                "product_id": move2.product_id.id,
+                "product_uom": move2.product_uom.id,
+                "product_uom_qty": 1.0,
+                "location_id": ret.location_id.id,
+                "location_dest_id": ret.location_dest_id.id,
+                "picking_id": ret.id,
+                "origin_returned_move_id": move2.id,
+                "company_id": ret.company_id.id,
+            }
+        )
+        # Validate return
+        # sudo here, return is in pick1.company_id,
+        # but user_company_b may not have rights
+        ret = ret.sudo().with_company(pick1.company_id)
+        ret.action_confirm()
+        for move in ret.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        ret.button_validate()
+        # Mirroring is skipped YES
+        # 2026-02-04 14:20:42,728 353353 WARNING eighteen
+        # odoo.addons.purchase_sale_stock_inter_company.models.stock_picking:
+        # Intercompany return mirroring skipped for picking Compa/IN/00007:
+        # multiple intercompany origin pickings found: Compa/OUT/00024, Compa/OUT/00025
+        self.assertFalse(
+            ret.intercompany_picking_id,
+        )
