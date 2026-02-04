@@ -11,4 +11,4 @@ the other company.
 2.  If you check the option "Block manual validation of picking in the
     destination company" is not possible to validate manually the
     picking in the destination company.
-3.  If you validate a return for an inter-company delivery, the module will create and validate the corresponding return picking in the other company and link both return pickings through intercompany_picking_id.
+3.  If you validate a return for an inter-company delivery, the module will create and validate the corresponding return picking in the other company and link both return pickings through intercompany_picking_id. Return backorders are mirrored too.

@@ -95,7 +95,7 @@ class StockPicking(models.Model):
         # super rare case for multiple origin pickings
         if len(origin_pickings.filtered("intercompany_picking_id")) != 1:
             return  # TODO: silently?
-        origin_picking = origin_pickings[:1]
+        origin_picking = origin_pickings
         if not origin_picking or not origin_picking.intercompany_picking_id:
             return
         dest_origin = origin_picking.intercompany_picking_id
@@ -111,6 +111,8 @@ class StockPicking(models.Model):
             qty_by_product[move.product_id] = (
                 qty_by_product.get(move.product_id, 0.0) + qty
             )
+        if not qty_by_product:
+            return
         # Launch return wizard on destination picking
         wiz = (
             self.env["stock.return.picking"]
@@ -160,10 +162,17 @@ class StockPicking(models.Model):
             dest_company = purchase.company_id
             intercompany_user = dest_company.intercompany_sale_user_id
             dest_pick = self._get_intercompany_destination_picking(purchase)
-            if dest_pick:
-                # Pin the relationship both ways so future syncs are stable
-                self.intercompany_picking_id = dest_pick
-                dest_pick.intercompany_picking_id = self.id
+            if not dest_pick:
+                raise UserError(
+                    _(
+                        "No pending receipt picking found "
+                        "for PO %(po)s to mirror %(pick)s"
+                    )
+                    % {"po": purchase.name, "pick": self.name}
+                )
+            # Pin the relationship both ways so future syncs are stable
+            self.intercompany_picking_id = dest_pick
+            dest_pick.intercompany_picking_id = self.id
             dest_picking = dest_pick.with_user(intercompany_user).with_company(
                 dest_company
             )
@@ -310,9 +319,7 @@ class StockPicking(models.Model):
         if self.intercompany_picking_id:
             return self.intercompany_picking_id
         # 2) Match through SO line - PO line - PO move
-        po_lines = self.move_ids.mapped("sale_line_id.auto_purchase_line_id").filtered(
-            lambda self: self
-        )
+        po_lines = self.move_ids.mapped("sale_line_id.auto_purchase_line_id")
         linked_po_moves = po_lines.mapped("move_ids").filtered(
             lambda m: m.state not in ["done", "cancel"]
         )

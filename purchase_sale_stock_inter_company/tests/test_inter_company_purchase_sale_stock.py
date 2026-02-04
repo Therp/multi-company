@@ -626,7 +626,10 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         # Set quantities done on the picking and validate
         for move in so_picking_id.move_ids:
             move.quantity = move.product_uom_qty
-        with self.assertRaisesRegex(UserError, "There's no corresponding line in PO"):
+        # no pending destination receipt picking exists to mirror into.
+        with self.assertRaisesRegex(
+            UserError, "No pending receipt picking found for PO"
+        ):
             so_picking_id.button_validate()
 
     def test_sync_picking_multi_step(self):

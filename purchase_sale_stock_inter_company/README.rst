@@ -104,7 +104,7 @@ the other company.
 3. If you validate a return for an inter-company delivery, the module
    will create and validate the corresponding return picking in the
    other company and link both return pickings through
-   intercompany_picking_id.
+   intercompany_picking_id. Return backorders are mirrored too.
 
 Known issues / Roadmap
 ======================
