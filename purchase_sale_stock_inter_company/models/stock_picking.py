@@ -75,9 +75,7 @@ class StockPicking(models.Model):
         # already linked, do not link again
         if self.intercompany_picking_id:
             return False
-        origin_pickings = self.move_ids.mapped(
-            "origin_returned_move_id.picking_id"
-        ).filtered(lambda p: p)
+        origin_pickings = self.move_ids.mapped("origin_returned_move_id.picking_id")
         # Mirror if a single origin exists. If multiple, then problem
         all_intercompany_origins = origin_pickings.filtered("intercompany_picking_id")
         return bool(all_intercompany_origins) and len(all_intercompany_origins) == 1
@@ -93,9 +91,7 @@ class StockPicking(models.Model):
         if self.intercompany_picking_id:
             return
         # Find original picking being returned
-        origin_pickings = self.move_ids.mapped(
-            "origin_returned_move_id.picking_id"
-        ).filtered(lambda p: p)
+        origin_pickings = self.move_ids.mapped("origin_returned_move_id.picking_id")
         # super rare case for multiple origin pickings
         if len(origin_pickings.filtered("intercompany_picking_id")) != 1:
             return  # TODO: silently?
@@ -105,20 +101,15 @@ class StockPicking(models.Model):
         dest_origin = origin_picking.intercompany_picking_id
         dest_company = dest_origin.company_id
         intercompany_user = dest_company.intercompany_sale_user_id
-        # aggregate q by product
+        # aggregate q by product, take move line quantities
+        # as they are expected to be validated, fallback
+        # to move.quantity
         qty_by_product = {}
         for move in self.move_ids:
-            # choose DONE quantity by the sum of q lines, don't trust move.quantity
-            # match what was actually validated
-            done_qty = sum(
-                move.move_line_ids.filtered(lambda ml: ml.quantity > 0).mapped(
-                    "quantity"
-                )
-            )
-            if not done_qty:
-                continue
+            line_qty = sum(move.move_line_ids.mapped("quantity"))
+            qty = line_qty if move.move_line_ids else move.quantity
             qty_by_product[move.product_id] = (
-                qty_by_product.get(move.product_id, 0.0) + done_qty
+                qty_by_product.get(move.product_id, 0.0) + qty
             )
         # Launch return wizard on destination picking
         wiz = (

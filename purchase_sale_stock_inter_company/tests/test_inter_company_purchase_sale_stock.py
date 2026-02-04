@@ -1047,9 +1047,9 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         so_picking = so_picking[0]
         # Deliver full quantity (2)
         so_picking.action_confirm()
-        for mv in so_picking.move_ids:
-            mv.quantity = mv.product_uom_qty
-            mv.picked = True
+        for move in so_picking.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
         so_picking.with_user(self.user_company_b).button_validate()
         self.assertEqual(so_picking.state, "done")
         # delivery should be linked to a PO receipt
@@ -1078,9 +1078,9 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.assertNotEqual(so_return, so_picking)
         # Validate the return picking
         so_return.action_confirm()
-        for mv in so_return.move_ids:
-            mv.quantity = mv.product_uom_qty  # should be 1
-            mv.picked = True
+        for move in so_return.move_ids:
+            move.quantity = move.product_uom_qty  # should be 1
+            move.picked = True
         so_return.with_user(self.user_company_b).button_validate()
         self.assertEqual(so_return.state, "done")
         # destination company got a mirrored return; YES
@@ -1117,9 +1117,9 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         so_picking = so_picking[0]
         # Deliver full qty (2)
         so_picking.action_confirm()
-        for mv in so_picking.move_ids:
-            mv.quantity = mv.product_uom_qty
-            mv.picked = True
+        for move in so_picking.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
         so_picking.with_user(self.user_company_b).button_validate()
         self.assertEqual(so_picking.state, "done")
         # delivery linked to PO receipt
@@ -1143,9 +1143,9 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         so_return = so_return[0]
         # Validate return triggers mirroring in _action_done
         so_return.action_confirm()
-        for mv in so_return.move_ids:
-            mv.quantity = mv.product_uom_qty
-            mv.picked = True
+        for move in so_return.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
         so_return.with_user(self.user_company_b).button_validate()
         self.assertEqual(so_return.state, "done")
         # Mirror must exist
@@ -1209,9 +1209,9 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.assertEqual(len(so_delivery), 1)
         so_delivery = so_delivery[0]
         so_delivery.action_confirm()
-        for mv in so_delivery.move_ids:
-            mv.quantity = mv.product_uom_qty
-            mv.picked = True
+        for move in so_delivery.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
         so_delivery.with_user(self.user_company_b).button_validate()
         self.assertEqual(so_delivery.state, "done")
         # delivery is linked to a PO receipt
@@ -1237,9 +1237,9 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         so_return = so_return[0]
         # validate the return partially (qty 2), get a return backorder
         so_return.action_confirm()
-        for mv in so_return.move_ids:
-            mv.quantity = 2.0
-            mv.picked = True
+        for move in so_return.move_ids:
+            move.quantity = 2.0
+            move.picked = True
         res = so_return.with_user(self.user_company_b).button_validate()
         wiz_bo = (
             self.env["stock.backorder.confirmation"]
@@ -1263,9 +1263,9 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         )
         self.assertTrue(so_return_bo)
         so_return_bo.action_confirm()
-        for mv in so_return_bo.move_ids:
-            mv.quantity = mv.product_uom_qty  # should be 3
-            mv.picked = True
+        for move in so_return_bo.move_ids:
+            move.quantity = move.product_uom_qty  # should be 3
+            move.picked = True
         so_return_bo.with_user(self.user_company_b).button_validate()
         self.assertEqual(so_return_bo.state, "done")
         # return 2 must exist and be done with qty 3
@@ -1321,18 +1321,18 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.assertEqual(len(so_pick), 1)
         so_pick = so_pick[0]
         so_pick.action_confirm()
-        for mv in so_pick.move_ids:
-            mv.quantity = mv.product_uom_qty
-            mv.picked = True
+        for move in so_pick.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
         so_pick.with_user(self.user_company_b).button_validate()
         self.assertEqual(so_pick.state, "done")
         so_delivery_pick = so_pick._get_next_transfers()
         self.assertEqual(len(so_delivery_pick), 1)
         so_delivery_pick = so_delivery_pick[0]
         so_delivery_pick.action_confirm()
-        for mv in so_delivery_pick.move_ids:
-            mv.quantity = mv.product_uom_qty
-            mv.picked = True
+        for move in so_delivery_pick.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
         so_delivery_pick.with_user(self.user_company_b).button_validate()
         self.assertEqual(so_delivery_pick.state, "done")
         # Create RETURN with partial quantity 1, get a return backorder
@@ -1355,7 +1355,7 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         for move in so_return_1.move_ids:
             # Validate only 1 out of 2 to force a return backorder
             move.quantity = 1.0
-            mv.picked = True
+            move.picked = True
         res = so_return_1.with_user(self.user_company_b).button_validate()
         # there's a backorder wizard lurking in context
         bwiz = (
@@ -1382,9 +1382,9 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         )
         self.assertTrue(so_return_back)
         so_return_back.action_confirm()
-        for mv in so_return_back.move_ids:
-            mv.quantity = mv.product_uom_qty
-            mv.picked = True
+        for move in so_return_back.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
         so_return_back.with_user(self.user_company_b).button_validate()
         self.assertEqual(so_return_back.state, "done")
         # Assert mirrored return backorder exists and is linked
