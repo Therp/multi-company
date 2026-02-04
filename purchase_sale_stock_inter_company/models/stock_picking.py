@@ -58,7 +58,75 @@ class StockPicking(models.Model):
         for picking in self.filtered(lambda pick: pick._is_intercompany_delivery()):
             purchase = picking.sale_id.sudo().auto_purchase_order_id
             picking.sudo()._action_done_intercompany_actions(purchase)
+        # Intercompany return mirroring
+        # add context key to beat looping
+        if not self.env.context.get("skip_intercompany_return_mirror"):
+            for picking in self.filtered(lambda pick: pick._is_intercompany_return()):
+                picking.sudo()._mirror_intercompany_return()
         return res
+
+    def _is_intercompany_return(self):
+        """
+        Identify return pickings that belong to an intercompany flow.
+        It is definined by a non-falsy origin_returned_move_id.
+        Mirror it only if the original picking was intercompany
+        """
+        self.ensure_one()
+        if self.intercompany_picking_id:
+            return False
+        origin_pickings = self.move_ids.mapped(
+            "origin_returned_move_id.picking_id"
+        ).filtered(lambda p: p)
+        return bool(origin_pickings.filtered("intercompany_picking_id"))
+
+    def _mirror_intercompany_return(self):
+        """
+        Mirror a validated return to the other company by creating and validating
+        a corresponding return on the linked intercompany picking.
+        Utilize intercompany_picking_id for the link.
+        """
+        self.ensure_one()
+        # Find original picking being returned
+        origin_pickings = self.move_ids.mapped(
+            "origin_returned_move_id.picking_id"
+        ).filtered(lambda p: p)
+        origin_picking = origin_pickings[:1]
+        if not origin_picking or not origin_picking.intercompany_picking_id:
+            return
+        dest_origin = origin_picking.intercompany_picking_id
+        dest_company = dest_origin.company_id
+        intercompany_user = dest_company.intercompany_sale_user_id
+        # aggregate q by product
+        qty_by_product = {}
+        for move in self.move_ids:
+            qty_by_product[move.product_id] = (
+                qty_by_product.get(move.product_id, 0.0) + move.quantity
+            )
+        # Launch return wizard on destination picking
+        wiz = (
+            self.env["stock.return.picking"]
+            .with_user(intercompany_user)
+            .with_company(dest_company)
+            .with_context(
+                active_id=dest_origin.id,
+                active_ids=dest_origin.ids,
+                active_model="stock.picking",
+            )
+            .create({})
+        )
+        # Configure return quantities
+        for line in wiz.product_return_moves:
+            line.quantity = qty_by_product.get(line.product_id, 0.0)
+        dest_return = wiz._create_return()
+        # Link both return pickings
+        self.intercompany_picking_id = dest_return
+        dest_return.intercompany_picking_id = self.id
+        # Validate destination return without triggering mirror-back
+        dest_return.action_confirm()
+        for move in dest_return.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        dest_return.with_context(skip_intercompany_return_mirror=True).button_validate()
 
     def _get_product_intercompany_qty_done_dict(self, sale_move_lines, po_move_lines):
         """
@@ -82,73 +150,17 @@ class StockPicking(models.Model):
         try:
             dest_company = purchase.company_id
             intercompany_user = dest_company.intercompany_sale_user_id
-            po_picking_pending = purchase.picking_ids.filtered(
-                lambda x: x.state not in ["done", "cancel"]
-            )
-            dest_pick = self.browse()
-            # Choose a single destination picking for this source picking
-            # Partial deliveries create PO backorders, so a single
-            # PO can have multiple open receipts.
-            # We must select ONE destination receipt picking
-            # to mirror into for THIS SO picking:
-            # - prefer a PO receipt that is not yet linked -
-            #  intercompany_picking_id not set),
-            # - fallback to the first pending receipt if all are linked.
-            if self.intercompany_picking_id:
-                dest_pick = self.intercompany_picking_id
-            else:
-                dest_pick = (
-                    po_picking_pending.filtered(
-                        lambda p: not p.intercompany_picking_id
-                    )[:1]
-                    or po_picking_pending[:1]
-                )
-                # Set the chosen PO receipt on the source picking so syncs will be
-                # targeting the same destination picking.
-                self.intercompany_picking_id = (
-                    dest_pick if dest_pick else self.intercompany_picking_id
-                )
+            dest_pick = self._get_intercompany_destination_picking(purchase)
             if dest_pick:
-                # Link the chosen PO receipt back to this SO picking.
+                # Pin the relationship both ways so future syncs are stable
+                self.intercompany_picking_id = dest_pick
                 dest_pick.intercompany_picking_id = self.id
             dest_picking = dest_pick.with_user(intercompany_user).with_company(
                 dest_company
             )
-
-            def _get_intercompany_po_move(src_move):
-                """Get destination PO move for this delivery move
-                (SO-PO link, else product fallback)"""
-                StockMove = self.env["stock.move"]
-                po_move = StockMove
-                sale_line = src_move.sale_line_id
-                po_line = sale_line.auto_purchase_line_id if sale_line else False
-                if po_line:
-                    po_move = po_line.move_ids.filtered(
-                        lambda m, ic_pick=dest_picking: m.picking_id == ic_pick
-                        and m.state not in ["done", "cancel"]
-                    )[:1]
-                if not po_move:
-                    candidates = dest_picking.move_ids.filtered(
-                        lambda m: m.product_id == src_move.product_id
-                        and m.state not in ["done", "cancel"]
-                    )
-                    if len(candidates) > 1:
-                        raise UserError(
-                            _(
-                                "Multiple candidate receipt moves found for product "
-                                "%(product)s in picking %(pick)s."
-                            )
-                            % {
-                                "product": src_move.product_id.display_name,
-                                "pick": dest_picking.name,
-                            }
-                        )
-                    po_move = candidates[:1]
-                return po_move
-
             for move in self.move_ids:
                 move_lines = move.move_line_ids.filtered(lambda x: x.quantity > 0)
-                po_move_pending = _get_intercompany_po_move(move)
+                po_move_pending = self._get_intercompany_po_move(move, dest_picking)
                 po_move_lines = po_move_pending.move_line_ids
                 # Don’t raise an error
                 # if there are no move_line_ids and the location is transit.
@@ -228,6 +240,90 @@ class StockPicking(models.Model):
                 raise
             else:
                 self._notify_picking_problem(purchase)
+
+    def _get_intercompany_po_move(self, src_move, dest_picking):
+        """Get destination PO move for this delivery move
+        Try: src_move.sale_line_id.auto_purchase_line_id to its move(s) on dest_picking.
+        Fallback: match by product on dest_picking. Raise if multiple
+        """
+        StockMove = self.env["stock.move"]
+        po_move = StockMove
+        sale_line = src_move.sale_line_id
+        po_line = sale_line.auto_purchase_line_id if sale_line else False
+        if po_line:
+            po_move = po_line.move_ids.filtered(
+                lambda m, ic_pick=dest_picking: m.picking_id == ic_pick
+                and m.state not in ["done", "cancel"]
+            )[:1]
+        if not po_move:
+            candidates = dest_picking.move_ids.filtered(
+                lambda m: m.product_id == src_move.product_id
+                and m.state not in ["done", "cancel"]
+            )
+            if len(candidates) > 1:
+                raise UserError(
+                    _(
+                        "Multiple candidate receipt moves found for product "
+                        "%(product)s in picking %(pick)s. Candidates: %(candidates)s"
+                    )
+                    % {
+                        "product": src_move.product_id.display_name,
+                        "pick": dest_picking.name,
+                        "candidates": ", ".join(candidates.mapped("name")),
+                    }
+                )
+            po_move = candidates[:1]
+        return po_move
+
+    def _get_intercompany_destination_picking(self, purchase):
+        """
+        Select the destination PO receipt picking to mirror into for THIS SO picking.
+        Partial deliveries can create multiple open PO receipts.
+        We must select ONE receipt per SO picking:
+        - Prefer the receipt already linked via intercompany_picking_id
+        - Else prefer a receipt containing PO moves linked to this SO's lines
+        - Else fallback to an unlinked pending receipt
+        - Else fallback to the first pending receipt
+        """
+        self.ensure_one()
+        po_picking_pending = purchase.picking_ids.filtered(
+            lambda p: p.state not in ["done", "cancel"]
+        )
+        # 1) already linked
+        # Choose a single destination picking for this source picking
+        # Partial deliveries create PO backorders, so a single
+        # PO can have multiple open receipts.
+        # We must select ONE destination receipt picking
+        # to mirror into for THIS SO picking:
+        # - prefer a PO receipt that is not yet linked -
+        #  intercompany_picking_id not set),
+        # - fallback to the first pending receipt if all are linked.
+        if self.intercompany_picking_id:
+            return self.intercompany_picking_id
+        # 2) Match through SO line - PO line - PO move
+        po_lines = self.move_ids.mapped("sale_line_id.auto_purchase_line_id").filtered(
+            lambda self: self
+        )
+        linked_po_moves = po_lines.mapped("move_ids").filtered(
+            lambda m: m.state not in ["done", "cancel"]
+        )
+        matched_picks = po_picking_pending.filtered(
+            lambda p: bool(p.move_ids & linked_po_moves)
+        )
+        if len(matched_picks) == 1:
+            return matched_picks
+        if matched_picks:
+            # Prefer the receipt with the highest overlap
+            return max(
+                matched_picks,
+                key=lambda p: len(p.move_ids & linked_po_moves),
+            )
+        # 3) Prefer an unlinked pending receipt
+        unlinked = po_picking_pending.filtered(lambda p: not p.intercompany_picking_id)
+        if unlinked:
+            return unlinked[:1]
+        # 4) Ultimately fallback to first pending receipt
+        return po_picking_pending[:1]
 
     def _notify_picking_problem(self, purchase):
         """
