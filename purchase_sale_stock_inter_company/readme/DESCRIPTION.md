@@ -39,3 +39,5 @@ Improved robustness when delivery moves are not directly linked to purchase line
 In some flows, delivery moves may not carry a purchase_line_id.
 The synchronization logic now reliably falls back to the Sale-to-Purchase line link
 to identify the correct destination receipt move.
+
+When validating a return picking that originates from an inter-company delivery, the module will automatically create and validate the corresponding return picking in the other company. Both return pickings are linked using intercompany_picking_id.

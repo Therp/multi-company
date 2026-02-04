@@ -72,12 +72,15 @@ class StockPicking(models.Model):
         Mirror it only if the original picking was intercompany
         """
         self.ensure_one()
+        # already linked, do not link again
         if self.intercompany_picking_id:
             return False
         origin_pickings = self.move_ids.mapped(
             "origin_returned_move_id.picking_id"
         ).filtered(lambda p: p)
-        return bool(origin_pickings.filtered("intercompany_picking_id"))
+        # Mirror if a single origin exists. If multiple, then problem
+        all_intercompany_origins = origin_pickings.filtered("intercompany_picking_id")
+        return bool(all_intercompany_origins) and len(all_intercompany_origins) == 1
 
     def _mirror_intercompany_return(self):
         """
@@ -86,10 +89,16 @@ class StockPicking(models.Model):
         Utilize intercompany_picking_id for the link.
         """
         self.ensure_one()
+        # Do nothing if mirrored, silently
+        if self.intercompany_picking_id:
+            return
         # Find original picking being returned
         origin_pickings = self.move_ids.mapped(
             "origin_returned_move_id.picking_id"
         ).filtered(lambda p: p)
+        # super rare case for multiple origin pickings
+        if len(origin_pickings.filtered("intercompany_picking_id")) != 1:
+            return  # TODO: silently?
         origin_picking = origin_pickings[:1]
         if not origin_picking or not origin_picking.intercompany_picking_id:
             return
@@ -99,8 +108,17 @@ class StockPicking(models.Model):
         # aggregate q by product
         qty_by_product = {}
         for move in self.move_ids:
+            # choose DONE quantity by the sum of q lines, don't trust move.quantity
+            # match what was actually validated
+            done_qty = sum(
+                move.move_line_ids.filtered(lambda ml: ml.quantity > 0).mapped(
+                    "quantity"
+                )
+            )
+            if not done_qty:
+                continue
             qty_by_product[move.product_id] = (
-                qty_by_product.get(move.product_id, 0.0) + move.quantity
+                qty_by_product.get(move.product_id, 0.0) + done_qty
             )
         # Launch return wizard on destination picking
         wiz = (
@@ -145,7 +163,7 @@ class StockPicking(models.Model):
         res = {product: quantity}
         return res
 
-    def _action_done_intercompany_actions(self, purchase):  # noqa: C901
+    def _action_done_intercompany_actions(self, purchase):
         self.ensure_one()
         try:
             dest_company = purchase.company_id

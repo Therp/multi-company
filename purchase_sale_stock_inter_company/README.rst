@@ -73,6 +73,11 @@ purchase_line_id. The synchronization logic now reliably falls back to
 the Sale-to-Purchase line link to identify the correct destination
 receipt move.
 
+When validating a return picking that originates from an inter-company
+delivery, the module will automatically create and validate the
+corresponding return picking in the other company. Both return pickings
+are linked using intercompany_picking_id.
+
 **Table of contents**
 
 .. contents::
@@ -96,6 +101,10 @@ the other company.
 2. If you check the option "Block manual validation of picking in the
    destination company" is not possible to validate manually the picking
    in the destination company.
+3. If you validate a return for an inter-company delivery, the module
+   will create and validate the corresponding return picking in the
+   other company and link both return pickings through
+   intercompany_picking_id.
 
 Known issues / Roadmap
 ======================
@@ -105,7 +114,9 @@ Known issues / Roadmap
    backorders, and returns are supported and synchronized between
    companies, but multi-step receipt and delivery flows could still be
    improved further.
-
+-  Return mirroring currently focuses on quantities;
+   lot/serial/package-level mirroring for returns could be extended
+   further.
 -  This module does not sync packages.
 
 Bug Tracker
