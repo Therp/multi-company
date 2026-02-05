@@ -2,6 +2,7 @@
 # Copyright 2019-2019 Chafique DELLI @ Akretion
 # Copyright 2018-2019 Tecnativa - Carlos Dauden
 # Copyright 2020 ForgeFlow S.L. (https://www.forgeflow.com)
+# Copyright 2026 Therp BV <https://therp.nl>.
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
 from odoo import Command
@@ -842,14 +843,10 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         po_picking = purchase.picking_ids
         so_picking = sale.picking_ids
         so_move = so_picking.move_ids
-        self.assertTrue(so_move.sale_line_id)
         self.assertTrue(so_move.sale_line_id.auto_purchase_line_id)
         # Reproduce the real-world issue:
         # outgoing delivery move has no purchase_line_id set.
         so_move.purchase_line_id = False
-        self.assertFalse(
-            so_move.purchase_line_id,
-        )
         # Set serial move lines and validate the SO picking
         so_move.move_line_ids = [
             Command.clear(),
@@ -884,24 +881,16 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         po_lots = po_picking.mapped("move_ids.move_line_ids.lot_id")
         # lots are mirrored 1:1
         self.assertEqual(
-            len(so_lots),
-            len(po_lots),
-        )
-        self.assertEqual(
             so_lots,
             po_lots,
-        )
-        self.assertEqual(
-            so_lots.mapped("name"),
-            po_lots.mapped("name"),
         )
 
     def test_sync_picking_multiple_po_moves_raises(self):
         """
-        Safeguard test
+        Safeguard test:
         the  product-based fallback finds multiple destination receipt moves,
         we must raise a clear UserError
-        This protects cases where the destination picking contains duplicate
+        This guards from cases where the destination picking contains duplicate
         receipt moves for the same product.
         """
         self.company_a.sync_picking = True
@@ -914,16 +903,13 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         sale = self._approve_po(purchase)
         po_picking = purchase.picking_ids
         so_picking = sale.picking_ids
-        so_move = so_picking.move_ids[:1]
+        so_move = so_picking.move_ids
         self.assertTrue(so_move)
         # Force to use the product-based fallback.
-        # remove the SO->PO link so _get_intercompany_po_move() can't use it.
+        # remove the SO->PO link so _get_intercompany_po_move() fails.
         sale_line = so_move.sale_line_id
         self.assertTrue(sale_line)
         sale_line.auto_purchase_line_id = False
-        self.assertFalse(
-            sale_line.auto_purchase_line_id,
-        )
         # Ensure there are indeed multiple candidate receipt moves for the same product
         candidates = po_picking.move_ids.filtered(
             lambda m: m.product_id == so_move.product_id
@@ -943,11 +929,11 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
 
     def test_sync_picking_partial_delivery_backorder(self):
         """
-        Regression test (partial deliveries/backorders)
+        Regression test:
         When the SO delivery is partially validated (creating a backorder),
         the PO receipt must mirror the same partial quantity and create a matching
-        backorder receipt on the PO side (ΝΟΤ receive everything at once).
-        Then, validating the SO backorder must complete the PO receipt quantities.
+        backorder receipt on the PO side (and avoid to receive everything at once).
+        Validating the SO backorder must complete the PO receipt quantities.
         """
         self.company_a.sync_picking = True
         self.company_b.sync_picking = True
@@ -963,9 +949,7 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         # We expect one SO picking initially
         so_picking = sale.picking_ids
         self.assertEqual(len(so_picking), 1)
-        so_picking = so_picking[0]
         # PO picking exists and should be waiting until sync
-        self.assertTrue(purchase.picking_ids)
         self.assertEqual(purchase.picking_ids.state, "waiting")
         # validate SO picking partially and get a backorder
         so_picking.with_company(so_picking.company_id).action_confirm()
@@ -1007,7 +991,6 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         # validate the SO backorder for remaining qty 5
         so_backorder = sale.picking_ids.filtered(lambda p: p.state != "done")
         self.assertEqual(len(so_backorder), 1)
-        so_backorder = so_backorder[0]
         so_backorder.with_company(so_backorder.company_id).action_confirm()
         so_backorder.move_ids.quantity = 5.0
         so_backorder.move_ids.picked = True
@@ -1025,7 +1008,7 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
             sorted(purchase.picking_ids.mapped("move_line_ids.quantity")), [5.0, 5.0]
         )
 
-    def test_sync_picking_return_mirroring_basic(self):
+    def test_sync_picking_return_mirroring_base(self):
         """
         Regression test:
         A return validated on one side of an intercompany delivery
@@ -1034,21 +1017,26 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         """
         self.company_a.sync_picking = True
         self.company_b.sync_picking = True
-        self.company_b.sale_auto_validation = False
+        self.company_b.sale_auto_validation = False  # no auto stuff now
         # Create intercompany PO to SO
         purchase = self._create_purchase_order(
             self.partner_company_b, self.consumable_product
         )
         purchase.order_line.product_qty = 2.0
         sale = self._approve_po(purchase)
-        if sale.state in ("draft", "sent"):
-            sale.action_confirm()
+        # Confirm the SO explicitly in the SO's company and as the proper user
+        self.assertEqual(sale.state, "draft")
+        sale.with_company(sale.company_id).with_user(
+            self.user_company_b
+        ).action_confirm()
         so_picking = sale.picking_ids.filtered(
             lambda p: p.picking_type_id.code == "outgoing"
         )
         self.assertEqual(len(so_picking), 1)
-        so_picking = so_picking[0]
         # Deliver full quantity (2)
+        so_picking = so_picking.with_company(sale.company_id).with_user(
+            self.user_company_b
+        )
         so_picking.action_confirm()
         for move in so_picking.move_ids:
             move.quantity = move.product_uom_qty
@@ -1070,21 +1058,20 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
             .create({})
         )
         wiz.product_return_moves.quantity = 1.0
-        # Grab the picking
-        so_return = wiz._create_return()
-        self.assertTrue(so_return)
-        self.assertEqual(so_return._name, "stock.picking")
+        # Grab the picking, as a correct company/user
+        so_return = (
+            wiz._create_return()
+            .with_company(sale.company_id)
+            .with_user(self.user_company_b)
+        )
         self.assertEqual(len(so_return), 1)
         self.assertNotEqual(so_return.id, so_picking.id)
-        so_return = so_return[0]
-        self.assertTrue(so_return)
-        self.assertNotEqual(so_return, so_picking)
         # Validate the return picking
         so_return.action_confirm()
         for move in so_return.move_ids:
             move.quantity = move.product_uom_qty  # should be 1
             move.picked = True
-        so_return.with_user(self.user_company_b).button_validate()
+        so_return.button_validate()
         self.assertEqual(so_return.state, "done")
         # destination company got a mirrored return; YES
         dest_return = so_return.intercompany_picking_id
@@ -1111,23 +1098,27 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         )
         purchase.order_line.product_qty = 2.0
         sale = self._approve_po(purchase)
-        if sale.state in ("draft", "sent"):
-            sale.action_confirm()
+        # Confirm the SO explicitly in the SO's company and as the proper user
+        self.assertEqual(sale.state, "draft")
+        sale.with_company(sale.company_id).with_user(
+            self.user_company_b
+        ).action_confirm()
         so_picking = sale.picking_ids.filtered(
             lambda p: p.picking_type_id.code == "outgoing"
         )
+        so_picking = so_picking.with_company(sale.company_id).with_user(
+            self.user_company_b
+        )
         self.assertEqual(len(so_picking), 1)
-        so_picking = so_picking[0]
         # Deliver full qty (2)
         so_picking.action_confirm()
         for move in so_picking.move_ids:
             move.quantity = move.product_uom_qty
             move.picked = True
-        so_picking.with_user(self.user_company_b).button_validate()
+        so_picking.button_validate()
         self.assertEqual(so_picking.state, "done")
         # delivery linked to PO receipt
         po_receipt = so_picking.intercompany_picking_id
-        self.assertTrue(po_receipt)
         self.assertEqual(po_receipt.intercompany_picking_id, so_picking)
         # Create SO return qty 1
         wiz = (
@@ -1140,20 +1131,21 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
             .create({})
         )
         wiz.product_return_moves.quantity = 1.0
-        so_return = wiz._create_return()
-        self.assertTrue(so_return)
+        so_return = (
+            wiz._create_return()
+            .with_company(sale.company_id)
+            .with_user(self.user_company_b)
+        )
         self.assertEqual(len(so_return), 1)
-        so_return = so_return[0]
         # Validate return triggers mirroring in _action_done
         so_return.action_confirm()
         for move in so_return.move_ids:
             move.quantity = move.product_uom_qty
             move.picked = True
-        so_return.with_user(self.user_company_b).button_validate()
+        so_return.button_validate()
         self.assertEqual(so_return.state, "done")
         # Mirror must exist
         dest_return = so_return.intercompany_picking_id
-        self.assertTrue(dest_return)
         self.assertEqual(dest_return.intercompany_picking_id, so_return)
         # Count how many destination returns point back to this SO return
         dest_company = dest_return.company_id
@@ -1169,7 +1161,7 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         )
         self.assertEqual(linked_before, 1)
         # Call mirror again, nothing should happen
-        so_return.sudo()._mirror_intercompany_return()
+        so_return._mirror_intercompany_return()
         # Link must remain the same and no extra destination return created
         self.assertEqual(so_return.intercompany_picking_id, dest_return)
         self.assertEqual(dest_return.intercompany_picking_id, so_return)
@@ -1187,7 +1179,7 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
 
     def test_sync_picking_return_mirroring_partial_with_backorder(self):
         """
-        Regression test (returns with backorder):
+        Regression test:
         If an intercompany return is validated partially
         (creating a return backorder),
         each return picking must be mirrored  1 to 1 to the other company
@@ -1195,7 +1187,7 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         """
         self.company_a.sync_picking = True
         self.company_b.sync_picking = True
-        self.company_b.sale_auto_validation = False  # keep flows explicit
+        self.company_b.sale_auto_validation = False
         self.partner_company_b.company_id = False
         self.consumable_product.type = "consu"
         # Create intercompany PO to SO for qty 5 and deliver it fully
@@ -1204,22 +1196,25 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         )
         purchase.order_line.product_qty = 5.0
         sale = self._approve_po(purchase)
-        if sale.state in ("draft", "sent"):
-            sale.action_confirm()
+        self.assertEqual(sale.state, "draft")
+        sale.with_company(sale.company_id).with_user(
+            self.user_company_b
+        ).action_confirm()
         so_delivery = sale.picking_ids.filtered(
             lambda p: p.picking_type_id.code == "outgoing"
         )
         self.assertEqual(len(so_delivery), 1)
-        so_delivery = so_delivery[0]
+        so_delivery = so_delivery.with_company(sale.company_id).with_user(
+            self.user_company_b
+        )
         so_delivery.action_confirm()
         for move in so_delivery.move_ids:
             move.quantity = move.product_uom_qty
             move.picked = True
-        so_delivery.with_user(self.user_company_b).button_validate()
+        so_delivery.button_validate()
         self.assertEqual(so_delivery.state, "done")
         # delivery is linked to a PO receipt
         po_receipt = so_delivery.intercompany_picking_id
-        self.assertTrue(po_receipt)
         self.assertEqual(po_receipt.intercompany_picking_id, so_delivery)
         # Create a return for full qty 5 from the SO delivery picking
         wiz = (
@@ -1234,16 +1229,19 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         # return everything so that partial validation creates a backorder
         for line in wiz.product_return_moves:
             line.quantity = 5.0
-        so_return = wiz._create_return()
+        so_return = (
+            wiz._create_return()
+            .with_company(sale.company_id)
+            .with_user(self.user_company_b)
+        )
         self.assertTrue(so_return)
         self.assertEqual(len(so_return), 1)
-        so_return = so_return[0]
         # validate the return partially (qty 2), get a return backorder
         so_return.action_confirm()
         for move in so_return.move_ids:
             move.quantity = 2.0
             move.picked = True
-        res = so_return.with_user(self.user_company_b).button_validate()
+        res = so_return.button_validate()
         wiz_bo = (
             self.env["stock.backorder.confirmation"]
             .with_context(**res["context"])
@@ -1253,7 +1251,6 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.assertEqual(so_return.state, "done")
         # (mirrored) return 1 must exist and be done with qty 2
         dest_return_1 = so_return.intercompany_picking_id
-        self.assertTrue(dest_return_1)
         self.assertEqual(dest_return_1.intercompany_picking_id, so_return)
         self.assertEqual(dest_return_1.state, "done")
         self.assertEqual(sum(dest_return_1.move_ids.mapped("quantity")), 2.0)
@@ -1273,7 +1270,6 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.assertEqual(so_return_bo.state, "done")
         # return 2 must exist and be done with qty 3
         dest_return_2 = so_return_bo.intercompany_picking_id
-        self.assertTrue(dest_return_2)
         self.assertEqual(dest_return_2.intercompany_picking_id, so_return_bo)
         self.assertEqual(dest_return_2.state, "done")
         self.assertEqual(sum(dest_return_2.move_ids.mapped("quantity")), 3.0)
@@ -1282,7 +1278,7 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
 
     def test_sync_picking_return_mirroring_multi_step_with_transit_backorder(self):
         """
-        Regression test (returns + multi-step + transit + backorder):
+        Regression test:
         In intercompany flows using transit locations and multi-step routes,
         a partial return (creating a backorder) must be mirrored to the other company,
         and the return backorder must also be mirrored and linked 1 to 1 via
@@ -1290,7 +1286,7 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         """
         self.company_a.sync_picking = True
         self.company_b.sync_picking = True
-        # Multi-step + transit setup
+        # Multi-step and transit setup
         self.warehouse_a.reception_steps = "two_steps"
         self.warehouse_c.delivery_steps = "pick_ship"
         interco_location = self.env.ref("stock.stock_location_inter_company")
@@ -1312,9 +1308,9 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         )
         purchase.order_line.product_qty = 2.0
         sale = self._approve_po(purchase)
-        # Validate SO flow fully so we have a done customer delivery picking
-        if sale.state in ("draft", "sent"):
-            sale.action_confirm()
+        # Auto validatiop is on, so state is sale
+        # SO is validated fully so we have a done customer delivery picking.
+        self.assertEqual(sale.state, "sale")
         # In pick/ship, the outgoing delivery is typically created only AFTER
         # validating the internal picking. Validate internal first, then fetch
         # the next transfer (outgoing).
@@ -1322,21 +1318,23 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
             lambda p: p.picking_type_id.code == "internal"
         )
         self.assertEqual(len(so_pick), 1)
-        so_pick = so_pick[0]
+        so_pick = so_pick.with_company(sale.company_id).with_user(self.user_company_b)
         so_pick.action_confirm()
         for move in so_pick.move_ids:
             move.quantity = move.product_uom_qty
             move.picked = True
-        so_pick.with_user(self.user_company_b).button_validate()
+        so_pick.button_validate()
         self.assertEqual(so_pick.state, "done")
         so_delivery_pick = so_pick._get_next_transfers()
+        so_delivery_pick = so_delivery_pick.with_company(sale.company_id).with_user(
+            self.user_company_b
+        )
         self.assertEqual(len(so_delivery_pick), 1)
-        so_delivery_pick = so_delivery_pick[0]
         so_delivery_pick.action_confirm()
         for move in so_delivery_pick.move_ids:
             move.quantity = move.product_uom_qty
             move.picked = True
-        so_delivery_pick.with_user(self.user_company_b).button_validate()
+        so_delivery_pick.button_validate()
         self.assertEqual(so_delivery_pick.state, "done")
         # Create RETURN with partial quantity 1, get a return backorder
         wiz = (
@@ -1352,14 +1350,16 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         # The backorder is created by validating the return picking partially.
         wiz.product_return_moves.quantity = 2.0
         so_return_1 = wiz._create_return()
+        so_return_1 = so_return_1.with_company(sale.company_id).with_user(
+            self.user_company_b
+        )
         self.assertTrue(so_return_1)
-        so_return_1 = so_return_1[:1]
         so_return_1.action_confirm()
         for move in so_return_1.move_ids:
             # Validate only 1 out of 2 to force a return backorder
             move.quantity = 1.0
             move.picked = True
-        res = so_return_1.with_user(self.user_company_b).button_validate()
+        res = so_return_1.button_validate()
         # there's a backorder wizard lurking in context
         bwiz = (
             self.env["stock.backorder.confirmation"]
@@ -1370,7 +1370,6 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.assertEqual(so_return_1.state, "done")
         # Assert mirrored return exists and is linked
         dest_return_1 = so_return_1.intercompany_picking_id
-        self.assertTrue(dest_return_1)
         self.assertEqual(dest_return_1.intercompany_picking_id, so_return_1)
         self.assertEqual(dest_return_1.state, "done")
         self.assertEqual(sum(dest_return_1.move_ids.mapped("quantity")), 1.0)
@@ -1392,7 +1391,6 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.assertEqual(so_return_back.state, "done")
         # Assert mirrored return backorder exists and is linked
         dest_return_back = so_return_back.intercompany_picking_id
-        self.assertTrue(dest_return_back)
         self.assertEqual(dest_return_back.intercompany_picking_id, so_return_back)
         self.assertEqual(dest_return_back.state, "done")
         self.assertEqual(sum(dest_return_back.move_ids.mapped("quantity")), 1.0)
@@ -1418,10 +1416,14 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         purchase2.order_line.product_qty = 2.0
         sale1 = self._approve_po(purchase1)
         sale2 = self._approve_po(purchase2)
-        if sale1.state in ("draft", "sent"):
-            sale1.action_confirm()
-        if sale2.state in ("draft", "sent"):
-            sale2.action_confirm()
+        self.assertEqual(sale1.state, "draft")
+        self.assertEqual(sale2.state, "draft")
+        sale1.with_company(sale1.company_id).with_user(
+            self.user_company_b
+        ).action_confirm()
+        sale2.with_company(sale1.company_id).with_user(
+            self.user_company_b
+        ).action_confirm()
         pick1 = sale1.picking_ids.filtered(
             lambda p: p.picking_type_id.code == "outgoing"
         )[:1]
@@ -1451,13 +1453,12 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         wiz = ReturnWiz.create({})
         wiz.product_return_moves.quantity = 1.0
         ret = wiz._create_return().with_company(pick1.company_id)
-        self.assertTrue(ret)
-        ret = ret[:1]
+        self.assertEqual(len(ret), 1)
         self.assertEqual(ret.company_id, pick1.company_id)
         # Create a SECOND origin delivery picking in the SAME company as pick1
         # We want another move with origin_returned_move_id in company B,
-        # but still intercompany-linked, so that _is_intercompany_return()
-        # sees multiple intercompany origins and skips mirroring.
+        # but still intercompany-linked, so that multiple intercompany
+        # origins exist and mirroring is skipped.
         pick2 = sale2.picking_ids.filtered(
             lambda p: p.picking_type_id.code == "outgoing"
             and p.company_id == pick1.company_id
@@ -1472,7 +1473,6 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.assertTrue(pick2.intercompany_picking_id)
         # Inject an extra return move pointing to an origin move from pick2
         move2 = pick2.move_ids[:1]
-        self.assertTrue(move2)
         self.assertEqual(move2.company_id, ret.company_id)
         # create the move in the correct company
         StockMove.sudo().with_company(ret.company_id).create(
@@ -1520,13 +1520,14 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         )
         purchase.order_line.product_qty = 2.0
         sale = self._approve_po(purchase)
-        if sale.state in ("draft", "sent"):
-            sale.action_confirm()
+        self.assertEqual(sale.state, "draft")
+        sale.with_company(sale.company_id).with_user(
+            self.user_company_b
+        ).action_confirm()
         so_delivery = sale.picking_ids.filtered(
             lambda p: p.picking_type_id.code == "outgoing"
         )
         self.assertEqual(len(so_delivery), 1)
-        so_delivery = so_delivery[0]
         so_move = so_delivery.move_ids
         self.assertEqual(len(so_move), 1)
         # Deliver 2 serials.
@@ -1575,10 +1576,8 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.assertTrue(so_return)
         so_return = so_return[0]
         so_return.action_confirm()
-
         ret_move = so_return.move_ids
         self.assertEqual(len(ret_move), 1)
-        ret_move = ret_move[0]
         ret_move.move_line_ids = [
             Command.clear(),
             Command.create(
@@ -1596,7 +1595,6 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         so_return.with_user(self.user_company_b).button_validate()
         self.assertEqual(so_return.state, "done")
         dest_return = so_return.intercompany_picking_id
-        self.assertTrue(dest_return)
         self.assertEqual(dest_return.state, "done")
         self.assertEqual(sum(dest_return.move_line_ids.mapped("quantity")), 1.0)
         self.assertEqual(
