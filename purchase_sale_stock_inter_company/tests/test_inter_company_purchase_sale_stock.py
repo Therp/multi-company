@@ -1505,3 +1505,101 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.assertFalse(
             ret.intercompany_picking_id,
         )
+
+    def test_sync_picking_return_mirroring_serial_lots(self):
+        """
+        Regression test:
+        For tracked products (serial/lot), return mirroring must also mirror the
+        lot/serial numbers to the other company.
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        self.company_b.sale_auto_validation = False
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.stockable_product_serial
+        )
+        purchase.order_line.product_qty = 2.0
+        sale = self._approve_po(purchase)
+        if sale.state in ("draft", "sent"):
+            sale.action_confirm()
+        so_delivery = sale.picking_ids.filtered(
+            lambda p: p.picking_type_id.code == "outgoing"
+        )
+        self.assertEqual(len(so_delivery), 1)
+        so_delivery = so_delivery[0]
+        so_move = so_delivery.move_ids
+        self.assertEqual(len(so_move), 1)
+        # Deliver 2 serials.
+        so_move.move_line_ids = [
+            Command.clear(),
+            Command.create(
+                {
+                    "location_id": so_move.location_id.id,
+                    "location_dest_id": so_move.location_dest_id.id,
+                    "product_id": self.stockable_product_serial.id,
+                    "product_uom_id": self.stockable_product_serial.uom_id.id,
+                    "quantity": 1,
+                    "lot_id": self.serial_2.id,
+                    "picking_id": so_delivery.id,
+                },
+            ),
+            Command.create(
+                {
+                    "location_id": so_move.location_id.id,
+                    "location_dest_id": so_move.location_dest_id.id,
+                    "product_id": self.stockable_product_serial.id,
+                    "product_uom_id": self.stockable_product_serial.uom_id.id,
+                    "quantity": 1,
+                    "lot_id": self.serial_3.id,
+                    "picking_id": so_delivery.id,
+                },
+            ),
+        ]
+        so_delivery.action_confirm()
+        so_delivery.with_user(self.user_company_b).button_validate()
+        self.assertEqual(so_delivery.state, "done")
+        po_receipt = so_delivery.intercompany_picking_id
+        self.assertTrue(po_receipt)
+        # Create a return for qty 1 and explicitly pick ONE serial.
+        wiz = (
+            self.env["stock.return.picking"]
+            .with_context(
+                active_id=so_delivery.id,
+                active_ids=so_delivery.ids,
+                active_model="stock.picking",
+            )
+            .create({})
+        )
+        wiz.product_return_moves.quantity = 1.0
+        so_return = wiz._create_return()
+        self.assertTrue(so_return)
+        so_return = so_return[0]
+        so_return.action_confirm()
+
+        ret_move = so_return.move_ids
+        self.assertEqual(len(ret_move), 1)
+        ret_move = ret_move[0]
+        ret_move.move_line_ids = [
+            Command.clear(),
+            Command.create(
+                {
+                    "location_id": ret_move.location_id.id,
+                    "location_dest_id": ret_move.location_dest_id.id,
+                    "product_id": self.stockable_product_serial.id,
+                    "product_uom_id": self.stockable_product_serial.uom_id.id,
+                    "quantity": 1,
+                    "lot_id": self.serial_2.id,
+                    "picking_id": so_return.id,
+                },
+            ),
+        ]
+        so_return.with_user(self.user_company_b).button_validate()
+        self.assertEqual(so_return.state, "done")
+        dest_return = so_return.intercompany_picking_id
+        self.assertTrue(dest_return)
+        self.assertEqual(dest_return.state, "done")
+        self.assertEqual(sum(dest_return.move_line_ids.mapped("quantity")), 1.0)
+        self.assertEqual(
+            dest_return.move_line_ids.lot_id.mapped("name"),
+            [self.serial_2.name],
+        )

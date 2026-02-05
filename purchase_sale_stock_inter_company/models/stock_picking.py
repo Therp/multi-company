@@ -171,6 +171,36 @@ class StockPicking(models.Model):
         dest_return.intercompany_picking_id = self.id
         # Validate destination return without triggering mirror-back
         dest_return.action_confirm()
+        # If the source return used lots/serials, mirror them on the destination return.
+        # This keeps tracked products consistent across companies for return flows.
+        source_mls = self.move_ids.move_line_ids.filtered(
+            lambda x: x.quantity > 0 and x.lot_id
+        )
+        if source_mls:
+            # group by product to apply onto destination moves
+            lot_qty_by_product = {}
+            for ml in source_mls:
+                lot_qty_by_product.setdefault(ml.product_id, []).append(
+                    (ml, ml.quantity)
+                )
+            for dest_move in dest_return.move_ids:
+                if dest_move.product_id not in lot_qty_by_product:
+                    continue
+                line_vals = []
+                for src_ml, qty in lot_qty_by_product[dest_move.product_id]:
+                    vals = dest_move._prepare_move_line_vals()
+                    vals.update(
+                        {
+                            "quantity": qty,
+                            "picked": True,
+                            "lot_id": src_ml.with_company(dest_company)
+                            ._ensure_lot_multicompany()
+                            .id,
+                        }
+                    )
+                    line_vals.append((0, 0, vals))
+                if line_vals:
+                    dest_move.write({"move_line_ids": [(5, 0, 0)] + line_vals})
         for move in dest_return.move_ids:
             move.quantity = move.product_uom_qty
             move.picked = True
