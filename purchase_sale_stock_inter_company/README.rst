@@ -137,6 +137,7 @@ Authors
 
 * Akretion
 * Tecnativa
+* Therp BV
 
 Contributors
 ------------

@@ -1177,6 +1177,110 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         )
         self.assertEqual(linked_after, 1)
 
+    def test_sync_picking_return_mirroring_reuse(self):
+        """
+        Regression test:
+        If a destination return already exists and points back to the source return
+        , mirroring must REUSE it and simply
+        relink the source return, instead of creating a duplicate destination return.
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        self.company_b.sale_auto_validation = False
+
+        # Create intercompany PO to SO
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.consumable_product
+        )
+        purchase.order_line.product_qty = 2.0
+        sale = self._approve_po(purchase)
+        # Confirm SO in its company with correct user
+        self.assertEqual(sale.state, "draft")
+        sale.with_company(sale.company_id).with_user(
+            self.user_company_b
+        ).action_confirm()
+        so_picking = sale.picking_ids.filtered(
+            lambda p: p.picking_type_id.code == "outgoing"
+        )
+        so_picking = so_picking.with_company(sale.company_id).with_user(
+            self.user_company_b
+        )
+        self.assertEqual(len(so_picking), 1)
+        # Deliver full qty
+        so_picking.action_confirm()
+        for move in so_picking.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        so_picking.button_validate()
+        self.assertEqual(so_picking.state, "done")
+        # delivery linked to PO receipt
+        po_receipt = so_picking.intercompany_picking_id
+        self.assertTrue(po_receipt)
+        self.assertEqual(po_receipt.intercompany_picking_id, so_picking)
+        # Create SO return qty 1
+        wiz = (
+            self.env["stock.return.picking"]
+            .with_company(sale.company_id)
+            .with_user(self.user_company_b)
+            .with_context(
+                active_id=so_picking.id,
+                active_ids=so_picking.ids,
+                active_model="stock.picking",
+            )
+            .create({})
+        )
+        wiz.product_return_moves.quantity = 1.0
+        so_return = (
+            wiz._create_return()
+            .with_company(sale.company_id)
+            .with_user(self.user_company_b)
+        )
+        self.assertEqual(len(so_return), 1)
+        # Validate return so that mirroring happens once
+        so_return.action_confirm()
+        for move in so_return.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        so_return.button_validate()
+        self.assertEqual(so_return.state, "done")
+        dest_return = so_return.intercompany_picking_id
+        self.assertTrue(dest_return)
+        self.assertEqual(dest_return.intercompany_picking_id, so_return)
+        dest_company = dest_return.company_id
+        # fake:
+        # destination return exists and still points to src, but src lost its link.
+        so_return.intercompany_picking_id = False
+        self.assertFalse(so_return.intercompany_picking_id)
+        # must be exactly 1 destination return pointing to src
+        linked_before = (
+            self.env["stock.picking"]
+            .with_company(dest_company)
+            .search_count(
+                [
+                    ("company_id", "=", dest_company.id),
+                    ("intercompany_picking_id", "=", so_return.id),
+                ]
+            )
+        )
+        self.assertEqual(linked_before, 1)
+        # Trigger mirroring again: must relink
+        # to existing dest_return, not create a new one
+        so_return._mirror_intercompany_return()
+        self.assertEqual(so_return.intercompany_picking_id, dest_return)
+        self.assertEqual(dest_return.intercompany_picking_id, so_return)
+        # after, still exactly 1
+        linked_after = (
+            self.env["stock.picking"]
+            .with_company(dest_company)
+            .search_count(
+                [
+                    ("company_id", "=", dest_company.id),
+                    ("intercompany_picking_id", "=", so_return.id),
+                ]
+            )
+        )
+        self.assertEqual(linked_after, 1)
+
     def test_sync_picking_return_mirroring_partial_with_backorder(self):
         """
         Regression test:

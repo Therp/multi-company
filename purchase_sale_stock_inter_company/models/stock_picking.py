@@ -185,19 +185,6 @@ class StockPicking(models.Model):
         origin_picking = self._get_intercompany_return_origin_picking()
         if not origin_picking:
             return
-        # if destination already has a return linked back to us, do nothing.
-        existing_dest = self.env["stock.picking"].search(
-            [("intercompany_picking_id", "=", self.id)],
-            limit=1,
-        )
-        if existing_dest:
-            _logger.info(
-                "Intercompany return already mirrored for picking %s -> %s",
-                self.name,
-                existing_dest.name,
-            )
-            self.intercompany_picking_id = existing_dest
-            return
         if not origin_picking.intercompany_picking_id:
             return
         dest_origin = origin_picking.intercompany_picking_id
@@ -220,6 +207,28 @@ class StockPicking(models.Model):
                 self.name,
             )
             return
+        # If a destination return already exists and points back to THIS return,
+        # reuse it instead of creating a duplicate
+        existing_dest_return = (
+            self.env["stock.picking"]
+            .with_company(dest_company)
+            .sudo()
+            .search(
+                [
+                    ("company_id", "=", dest_company.id),
+                    ("intercompany_picking_id", "=", self.id),
+                ],
+                limit=1,
+            )
+        )
+        if existing_dest_return:
+            _logger.info(
+                "Intercompany return already mirrored for picking %s -> %s",
+                self.name,
+                existing_dest_return.name,
+            )
+            self.intercompany_picking_id = existing_dest_return
+            return
         # Launch return wizard on destination picking
         wiz = (
             self.env["stock.return.picking"]
@@ -236,6 +245,10 @@ class StockPicking(models.Model):
         for line in wiz.product_return_moves:
             line.quantity = qty_by_product.get(line.product_id, 0.0)
         dest_return = wiz._create_return()
+        # Force destination company + user context for all operations hereof
+        dest_return = dest_return.with_company(dest_company).with_user(
+            intercompany_user
+        )
         # Link both return pickings
         self.intercompany_picking_id = dest_return
         dest_return.intercompany_picking_id = self.id
