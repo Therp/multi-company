@@ -3,6 +3,7 @@
 # Copyright 2026 Therp BV <https://therp.nl>.
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 import logging
+from collections import defaultdict
 
 from odoo import SUPERUSER_ID, _, api, fields, models
 from odoo.exceptions import UserError
@@ -181,6 +182,25 @@ class StockPicking(models.Model):
         # Do nothing if mirrored, silently
         if self.intercompany_picking_id:
             return
+        tracked_moves = self.move_ids.filtered(
+            lambda m: m.product_id.tracking in ("lot", "serial")
+        )
+        source_mls_with_lots = self.move_ids.move_line_ids.filtered(
+            lambda ml: ml.quantity > 0 and ml.lot_id
+        )
+        # If tracked products are involved but we have no lot/serial info to mirror,
+        # we must block.
+        if tracked_moves and not source_mls_with_lots:
+            raise UserError(
+                _(
+                    "Intercompany return mirroring requires lot/serial"
+                    " numbers for tracked products."
+                    "This return contains lot/serial tracked products,"
+                    " but no lots/serials were set on the return lines"
+                    "Please assign the lots/serials on the return first,"
+                    " or process the return manually on the other company."
+                )
+            )
         # Find original picking being returned
         origin_picking = self._get_intercompany_return_origin_picking()
         if not origin_picking:
@@ -193,13 +213,11 @@ class StockPicking(models.Model):
         # aggregate q by product, take move line quantities
         # as they are expected to be validated, fallback
         # to move.quantity
-        qty_by_product = {}
+        qty_by_product = defaultdict(float)
         for move in self.move_ids:
             line_qty = sum(move.move_line_ids.mapped("quantity"))
             qty = line_qty if move.move_line_ids else move.quantity
-            qty_by_product[move.product_id] = (
-                qty_by_product.get(move.product_id, 0.0) + qty
-            )
+            qty_by_product[move.product_id.id] += qty
         if not qty_by_product:
             _logger.warning(
                 "Intercompany return mirroring skipped"
@@ -243,7 +261,7 @@ class StockPicking(models.Model):
         )
         # Configure return quantities
         for line in wiz.product_return_moves:
-            line.quantity = qty_by_product.get(line.product_id, 0.0)
+            line.quantity = qty_by_product.get(line.product_id.id, 0.0)
         dest_return = wiz._create_return()
         # Force destination company + user context for all operations hereof
         dest_return = dest_return.with_company(dest_company).with_user(
