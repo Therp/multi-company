@@ -15,3 +15,5 @@
 - \`Komit \<https://komit-consulting.com\>\`:
   - Cuong Nguyen Mtm \<cuong.nmtm@komit-consulting.com\>
   - Nam TNT \<nam-tnt@komit-consulting.com\>
+- \`Therp BV \<<https://www.therp.nl>\>\`:
+  - Nikos Tsirintanis \<ntsirintanis@therp.nl\>

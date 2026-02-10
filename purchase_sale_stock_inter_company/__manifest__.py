@@ -1,6 +1,7 @@
 # Copyright 2013-Today Odoo SA
 # Copyright 2016-2019 Chafique DELLI @ Akretion
 # Copyright 2018-2019 Tecnativa - Carlos Dauden
+# Copyright 2026 Therp BV <https://therp.nl>.
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
 {
@@ -9,7 +10,7 @@
     "version": "18.0.1.0.2",
     "category": "Purchase Management",
     "website": "https://github.com/OCA/multi-company",
-    "author": "Akretion, Tecnativa, Odoo Community Association (OCA)",
+    "author": "Akretion, Tecnativa, Therp BV, Odoo Community Association (OCA)",
     "license": "AGPL-3",
     "installable": True,
     "auto_install": True,

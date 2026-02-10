@@ -1,9 +1,14 @@
 # Copyright 2018 Tecnativa - Carlos Dauden
 # Copyright 2018 Tecnativa - Pedro M. Baeza
+# Copyright 2026 Therp BV <https://therp.nl>.
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
+import logging
+from collections import defaultdict
 
 from odoo import SUPERUSER_ID, _, api, fields, models
 from odoo.exceptions import UserError
+
+_logger = logging.getLogger(__name__)
 
 
 class StockPicking(models.Model):
@@ -33,7 +38,6 @@ class StockPicking(models.Model):
                     picking.state = "waiting"
                 else:
                     picking.state = picking.intercompany_picking_id.state
-
         return res
 
     def button_validate(self):
@@ -58,23 +62,11 @@ class StockPicking(models.Model):
         for picking in self.filtered(lambda pick: pick._is_intercompany_delivery()):
             purchase = picking.sale_id.sudo().auto_purchase_order_id
             picking.sudo()._action_done_intercompany_actions(purchase)
-        return res
-
-    def _get_product_intercompany_qty_done_dict(self, sale_move_lines, po_move_lines):
-        """
-        Get the total quantity done
-        for the given sale move lines and purchase move lines.
-        This is used to update the purchase order with the quantities
-        received in the inter-company picking.
-        :param sale_move_lines:
-            browse_record(stock.move.line) Sale move lines to consider
-        :param po_move_lines:
-            browse_record(stock.move.line) Purchase move lines to consider
-        :return: dict with product as key and total quantity done as value
-        """
-        product = po_move_lines.product_id
-        quantity = sum(sale_move_lines.mapped("quantity"))
-        res = {product: quantity}
+        # Intercompany return mirroring
+        # add context key to beat looping
+        if not self.env.context.get("skip_intercompany_return_mirror"):
+            for picking in self.filtered(lambda pick: pick._is_intercompany_return()):
+                picking.sudo()._mirror_intercompany_return()
         return res
 
     def _action_done_intercompany_actions(self, purchase):
@@ -82,25 +74,24 @@ class StockPicking(models.Model):
         try:
             dest_company = purchase.company_id
             intercompany_user = dest_company.intercompany_sale_user_id
-            po_picking_pending = purchase.picking_ids.filtered(
-                lambda x: x.state not in ["done", "cancel"]
+            dest_pick = self._get_intercompany_destination_picking(purchase)
+            if not dest_pick:
+                raise UserError(
+                    _(
+                        "No pending receipt picking found "
+                        "for PO %(po)s to mirror %(pick)s"
+                    )
+                    % {"po": purchase.name, "pick": self.name}
+                )
+            # Pin the relationship both ways so future syncs are stable
+            self.intercompany_picking_id = dest_pick
+            dest_pick.intercompany_picking_id = self.id
+            dest_picking = dest_pick.with_user(intercompany_user).with_company(
+                dest_company
             )
-            po_picking_pending.intercompany_picking_id = self.id
-            if not self.intercompany_picking_id and po_picking_pending:
-                self.intercompany_picking_id = po_picking_pending[0]
-            dest_picking = self.intercompany_picking_id.with_user(
-                intercompany_user
-            ).with_company(dest_company)
             for move in self.move_ids:
                 move_lines = move.move_line_ids.filtered(lambda x: x.quantity > 0)
-                # To identify the correct move to write to,
-                # use both the SO-PO link and the intercompany_picking_id link
-                po_move_pending = (
-                    move.sale_line_id.auto_purchase_line_id.move_ids.filtered(
-                        lambda x, ic_pick=dest_picking: x.picking_id == ic_pick
-                        and x.state not in ["done", "cancel"]
-                    )
-                )
+                po_move_pending = self._get_intercompany_po_move(move, dest_picking)
                 po_move_lines = po_move_pending.move_line_ids
                 # Don’t raise an error
                 # if there are no move_line_ids and the location is transit.
@@ -108,7 +99,7 @@ class StockPicking(models.Model):
                 # but in transit locations,
                 # we need to create the move lines to assign lots/serials.
                 if not po_move_pending or (
-                    po_move_lines and move.location_dest_id.usage != "transit"
+                    not po_move_lines and move.location_dest_id.usage != "transit"
                 ):
                     raise UserError(
                         _(
@@ -181,6 +172,261 @@ class StockPicking(models.Model):
             else:
                 self._notify_picking_problem(purchase)
 
+    def _mirror_intercompany_return(self):
+        """
+        Mirror a validated return to the other company by creating and validating
+        a corresponding return on the linked intercompany picking.
+        Utilize intercompany_picking_id for the link.
+        """
+        self.ensure_one()
+        # Do nothing if mirrored, silently
+        if self.intercompany_picking_id:
+            return
+        tracked_moves = self.move_ids.filtered(
+            lambda m: m.product_id.tracking in ("lot", "serial")
+        )
+        source_mls_with_lots = self.move_ids.move_line_ids.filtered(
+            lambda ml: ml.quantity > 0 and ml.lot_id
+        )
+        # If tracked products are involved but we have no lot/serial info to mirror,
+        # we must block.
+        if tracked_moves and not source_mls_with_lots:
+            raise UserError(
+                _(
+                    "Intercompany return mirroring requires lot/serial"
+                    " numbers for tracked products."
+                    "This return contains lot/serial tracked products,"
+                    " but no lots/serials were set on the return lines"
+                    "Please assign the lots/serials on the return first,"
+                    " or process the return manually on the other company."
+                )
+            )
+        # Find original picking being returned
+        origin_picking = self._get_intercompany_return_origin_picking()
+        if not origin_picking:
+            return
+        if not origin_picking.intercompany_picking_id:
+            return
+        dest_origin = origin_picking.intercompany_picking_id
+        dest_company = dest_origin.company_id
+        intercompany_user = dest_company.intercompany_sale_user_id
+        # aggregate q by product, take move line quantities
+        # as they are expected to be validated, fallback
+        # to move.quantity
+        qty_by_product = defaultdict(float)
+        for move in self.move_ids:
+            line_qty = sum(move.move_line_ids.mapped("quantity"))
+            qty = line_qty if move.move_line_ids else move.quantity
+            qty_by_product[move.product_id.id] += qty
+        if not qty_by_product:
+            _logger.warning(
+                "Intercompany return mirroring skipped"
+                " for picking %s: no quantities found",
+                self.name,
+            )
+            return
+        # If a destination return already exists and points back to THIS return,
+        # reuse it instead of creating a duplicate
+        existing_dest_return = (
+            self.env["stock.picking"]
+            .with_company(dest_company)
+            .sudo()
+            .search(
+                [
+                    ("company_id", "=", dest_company.id),
+                    ("intercompany_picking_id", "=", self.id),
+                ],
+                limit=1,
+            )
+        )
+        if existing_dest_return:
+            _logger.info(
+                "Intercompany return already mirrored for picking %s -> %s",
+                self.name,
+                existing_dest_return.name,
+            )
+            self.intercompany_picking_id = existing_dest_return
+            return
+        # Launch return wizard on destination picking
+        wiz = (
+            self.env["stock.return.picking"]
+            .with_user(intercompany_user)
+            .with_company(dest_company)
+            .with_context(
+                active_id=dest_origin.id,
+                active_ids=dest_origin.ids,
+                active_model="stock.picking",
+            )
+            .create({})
+        )
+        # Configure return quantities
+        for line in wiz.product_return_moves:
+            line.quantity = qty_by_product.get(line.product_id.id, 0.0)
+        dest_return = wiz._create_return()
+        # Force destination company + user context for all operations hereof
+        dest_return = dest_return.with_company(dest_company).with_user(
+            intercompany_user
+        )
+        # Link both return pickings
+        self.intercompany_picking_id = dest_return
+        dest_return.intercompany_picking_id = self.id
+        # Validate destination return without triggering mirror-back
+        dest_return.action_confirm()
+        # If the source return used lots/serials, mirror them on the destination return.
+        # This keeps tracked products consistent across companies for return flows.
+        source_mls = self.move_ids.move_line_ids.filtered(
+            lambda x: x.quantity > 0 and x.lot_id
+        )
+        if source_mls:
+            # group by product to apply onto destination moves
+            lot_qty_by_product = {}
+            for ml in source_mls:
+                lot_qty_by_product.setdefault(ml.product_id, []).append(
+                    (ml, ml.quantity)
+                )
+            for dest_move in dest_return.move_ids:
+                if dest_move.product_id not in lot_qty_by_product:
+                    continue
+                line_vals = []
+                for src_ml, qty in lot_qty_by_product[dest_move.product_id]:
+                    vals = dest_move._prepare_move_line_vals()
+                    vals.update(
+                        {
+                            "quantity": qty,
+                            "picked": True,
+                            "lot_id": src_ml.with_company(dest_company)
+                            ._ensure_lot_multicompany()
+                            .id,
+                        }
+                    )
+                    line_vals.append((0, 0, vals))
+                if line_vals:
+                    dest_move.write({"move_line_ids": [(5, 0, 0)] + line_vals})
+        for move in dest_return.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        dest_return.with_context(skip_intercompany_return_mirror=True).button_validate()
+
+    def _get_product_intercompany_qty_done_dict(self, sale_move_lines, po_move_lines):
+        """
+        Get the total quantity done
+        for the given sale move lines and purchase move lines.
+        This is used to update the purchase order with the quantities
+        received in the inter-company picking.
+        :param sale_move_lines:
+            browse_record(stock.move.line) Sale move lines to consider
+        :param po_move_lines:
+            browse_record(stock.move.line) Purchase move lines to consider
+        :return: dict with product as key and total quantity done as value
+        """
+        product = po_move_lines.product_id
+        quantity = sum(sale_move_lines.mapped("quantity"))
+        res = {product: quantity}
+        return res
+
+    def _get_intercompany_return_origin_picking(self):
+        """
+        Return the single origin picking that makes this return an intercompany return.
+        A return picking may include moves that originate from multiple pickings.
+        We only mirror when we can identify exactly ONE intercompany origin picking,
+        i.e., exactly one origin picking has intercompany_picking_id set.
+        """
+        self.ensure_one()
+        origin_pickings = self.move_ids.mapped("origin_returned_move_id.picking_id")
+        intercompany_origins = origin_pickings.filtered("intercompany_picking_id")
+        if len(intercompany_origins) != 1:
+            if intercompany_origins:
+                _logger.warning(
+                    "Intercompany return mirroring skipped for picking %s: "
+                    "multiple intercompany origin pickings found: %s",
+                    self.name,
+                    ", ".join(intercompany_origins.mapped("name")),
+                )
+            return self.browse()
+        return intercompany_origins
+
+    def _get_intercompany_po_move(self, src_move, dest_picking):
+        """Get destination PO move for this delivery move
+        Try: src_move.sale_line_id.auto_purchase_line_id to its move(s) on dest_picking.
+        Fallback: match by product on dest_picking. Raise if multiple
+        """
+        StockMove = self.env["stock.move"]
+        po_move = StockMove
+        sale_line = src_move.sale_line_id
+        po_line = sale_line.auto_purchase_line_id if sale_line else False
+        if po_line:
+            po_move = po_line.move_ids.filtered(
+                lambda m, ic_pick=dest_picking: m.picking_id == ic_pick
+                and m.state not in ["done", "cancel"]
+            )[:1]
+        if not po_move:
+            candidates = dest_picking.move_ids.filtered(
+                lambda m: m.product_id == src_move.product_id
+                and m.state not in ["done", "cancel"]
+            )
+            if len(candidates) > 1:
+                raise UserError(
+                    _(
+                        "Multiple candidate receipt moves found for product "
+                        "%(product)s in picking %(pick)s. Candidates: %(candidates)s"
+                    )
+                    % {
+                        "product": src_move.product_id.display_name,
+                        "pick": dest_picking.name,
+                        "candidates": ", ".join(candidates.mapped("name")),
+                    }
+                )
+            po_move = candidates[:1]
+        return po_move
+
+    def _get_intercompany_destination_picking(self, purchase):
+        """
+        Select the destination PO receipt picking to mirror into for THIS SO picking.
+        Partial deliveries can create multiple open PO receipts.
+        We must select ONE receipt per SO picking:
+        - Prefer the receipt already linked via intercompany_picking_id
+        - Else prefer a receipt containing PO moves linked to this SO's lines
+        - Else fallback to an unlinked pending receipt
+        - Else fallback to the first pending receipt
+        """
+        self.ensure_one()
+        po_picking_pending = purchase.picking_ids.filtered(
+            lambda p: p.state not in ["done", "cancel"]
+        )
+        # 1) already linked
+        # Choose a single destination picking for this source picking
+        # Partial deliveries create PO backorders, so a single
+        # PO can have multiple open receipts.
+        # We must select ONE destination receipt picking
+        # to mirror into for THIS SO picking:
+        # - prefer a PO receipt that is not yet linked -
+        #  intercompany_picking_id not set),
+        # - fallback to the first pending receipt if all are linked.
+        if self.intercompany_picking_id:
+            return self.intercompany_picking_id
+        # 2) Match through SO line - PO line - PO move
+        po_lines = self.move_ids.mapped("sale_line_id.auto_purchase_line_id")
+        linked_po_moves = po_lines.mapped("move_ids").filtered(
+            lambda m: m.state not in ["done", "cancel"]
+        )
+        matched_picks = po_picking_pending.filtered(
+            lambda p: bool(p.move_ids & linked_po_moves)
+        )
+        if len(matched_picks) == 1:
+            return matched_picks
+        if matched_picks:
+            # Prefer the receipt with the highest overlap
+            return max(
+                matched_picks,
+                key=lambda p: len(p.move_ids & linked_po_moves),
+            )
+        # 3) Prefer an unlinked pending receipt
+        unlinked = po_picking_pending.filtered(lambda p: not p.intercompany_picking_id)
+        if unlinked:
+            return unlinked[:1]
+        # 4) Ultimately fallback to first pending receipt
+        return po_picking_pending[:1]
+
     def _notify_picking_problem(self, purchase):
         """
         Create an activity to notify of a problem when syncing the intercompany picking.
@@ -226,3 +472,15 @@ class StockPicking(models.Model):
             self.location_dest_id.usage in ["customer", "transit"]
             and self.sale_id.sudo().auto_purchase_order_id
         )
+
+    def _is_intercompany_return(self):
+        """
+        Identify return pickings that belong to an intercompany flow.
+        It is definined by a non-falsy origin_returned_move_id.
+        Mirror it only if the original picking was intercompany
+        """
+        self.ensure_one()
+        # already linked, do not link again
+        if self.intercompany_picking_id:
+            return False
+        return bool(self._get_intercompany_return_origin_picking())

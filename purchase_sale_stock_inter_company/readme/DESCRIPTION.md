@@ -16,3 +16,28 @@ this company.
 When Company A sends a product tracked by lot or serial number, a new
 lot/serial number with the same name is created in Company B to match
 it, if one doesn't already exist.
+
+In addition to the existing behavior, this module has been improved to better support real-world inter-company stock flows:
+
+Partial deliveries and backorders are now mirrored correctly between companies.
+When a Delivery Order is partially validated on the Sale Order side, the corresponding
+Purchase Order receipt will:
+
+-receive only the delivered quantity,
+
+-create a matching backorder receipt for the remaining quantity,
+
+-and keep both sides aligned throughout the process.
+
+Deterministic linking between Sale and Purchase pickings.
+Each inter-company Delivery Order is now explicitly linked to exactly one corresponding
+Purchase Order receipt via intercompany_picking_id.
+This avoids incorrect behavior where multiple Purchase receipts could be updated
+by a single Delivery Order in partial or backorder scenarios.
+
+Improved robustness when delivery moves are not directly linked to purchase lines.
+In some flows, delivery moves may not carry a purchase_line_id.
+The synchronization logic now reliably falls back to the Sale-to-Purchase line link
+to identify the correct destination receipt move.
+
+When validating a return picking that originates from an inter-company delivery, the module will automatically create and validate the corresponding return picking in the other company. Both return pickings are linked using intercompany_picking_id.

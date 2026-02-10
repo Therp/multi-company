@@ -2,6 +2,7 @@
 # Copyright 2019-2019 Chafique DELLI @ Akretion
 # Copyright 2018-2019 Tecnativa - Carlos Dauden
 # Copyright 2020 ForgeFlow S.L. (https://www.forgeflow.com)
+# Copyright 2026 Therp BV <https://therp.nl>.
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
 from odoo import Command
@@ -626,7 +627,10 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         # Set quantities done on the picking and validate
         for move in so_picking_id.move_ids:
             move.quantity = move.product_uom_qty
-        with self.assertRaisesRegex(UserError, "There's no corresponding line in PO"):
+        # no pending destination receipt picking exists to mirror into.
+        with self.assertRaisesRegex(
+            UserError, "No pending receipt picking found for PO"
+        ):
             so_picking_id.button_validate()
 
     def test_sync_picking_multi_step(self):
@@ -822,3 +826,882 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
             so_lots, po_lots, msg="The lots of the moves should be the same"
         )
         self.assertFalse(so_lots.company_id, msg="Lots should not have a company.")
+
+    def test_sync_picking_lot_without_purchase_line_id(self):
+        """
+        Regression test:
+        On the delivery side (SO picking), stock.move.purchase_line_id may be empty.
+        Intercompany syncing must still find the destination PO move using the
+        SO-PO link (sale_line.auto_purchase_line_id) and mirror lots correctly.
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.stockable_product_serial
+        )
+        sale = self._approve_po(purchase)
+        po_picking = purchase.picking_ids
+        so_picking = sale.picking_ids
+        so_move = so_picking.move_ids
+        self.assertTrue(so_move.sale_line_id.auto_purchase_line_id)
+        # Reproduce the real-world issue:
+        # outgoing delivery move has no purchase_line_id set.
+        so_move.purchase_line_id = False
+        # Set serial move lines and validate the SO picking
+        so_move.move_line_ids = [
+            Command.clear(),
+            Command.create(
+                {
+                    "location_id": so_move.location_id.id,
+                    "location_dest_id": so_move.location_dest_id.id,
+                    "product_id": self.stockable_product_serial.id,
+                    "product_uom_id": self.stockable_product_serial.uom_id.id,
+                    "quantity": 1,
+                    "lot_id": self.serial_1.id,
+                    "picking_id": so_picking.id,
+                },
+            ),
+            Command.create(
+                {
+                    "location_id": so_move.location_id.id,
+                    "location_dest_id": so_move.location_dest_id.id,
+                    "product_id": self.stockable_product_serial.id,
+                    "product_uom_id": self.stockable_product_serial.uom_id.id,
+                    "quantity": 1,
+                    "lot_id": self.serial_2.id,
+                    "picking_id": so_picking.id,
+                },
+            ),
+        ]
+        so_picking.with_company(so_picking.company_id).action_confirm()
+        so_picking.with_company(so_picking.company_id).action_assign()
+        so_picking.with_user(self.user_company_b).button_validate()
+        self.assertEqual(so_picking.state, "done")
+        so_lots = so_move.mapped("move_line_ids.lot_id")
+        po_lots = po_picking.mapped("move_ids.move_line_ids.lot_id")
+        # lots are mirrored 1:1
+        self.assertEqual(
+            so_lots,
+            po_lots,
+        )
+
+    def test_sync_picking_multiple_po_moves_raises(self):
+        """
+        Safeguard test:
+        the  product-based fallback finds multiple destination receipt moves,
+        we must raise a clear UserError
+        This guards from cases where the destination picking contains duplicate
+        receipt moves for the same product.
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.consumable_product
+        )
+        # Duplicate same product line
+        purchase.order_line += purchase.order_line.copy({"product_qty": 1})
+        sale = self._approve_po(purchase)
+        po_picking = purchase.picking_ids
+        so_picking = sale.picking_ids
+        so_move = so_picking.move_ids
+        self.assertTrue(so_move)
+        # Force to use the product-based fallback.
+        # remove the SO->PO link so _get_intercompany_po_move() fails.
+        sale_line = so_move.sale_line_id
+        self.assertTrue(sale_line)
+        sale_line.auto_purchase_line_id = False
+        # Ensure there are indeed multiple candidate receipt moves for the same product
+        candidates = po_picking.move_ids.filtered(
+            lambda m: m.product_id == so_move.product_id
+            and m.state not in ["done", "cancel"]
+        )
+        self.assertTrue(
+            len(candidates) > 1,
+        )
+        # Set done qty so validation actually tries to sync
+        for move in so_picking.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        with self.assertRaisesRegex(
+            UserError, "Multiple candidate receipt moves found"
+        ):
+            so_picking.with_user(self.user_company_b).button_validate()
+
+    def test_sync_picking_partial_delivery_backorder(self):
+        """
+        Regression test:
+        When the SO delivery is partially validated (creating a backorder),
+        the PO receipt must mirror the same partial quantity and create a matching
+        backorder receipt on the PO side (and avoid to receive everything at once).
+        Validating the SO backorder must complete the PO receipt quantities.
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        self.consumable_product.type = "consu"
+        self.partner_company_b.company_id = False
+        # Create PO with qty 10 in company A (destination)
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.consumable_product
+        )
+        purchase.order_line.product_qty = 10.0
+        # Approve, creates SO in source, company B
+        sale = self._approve_po(purchase)
+        # We expect one SO picking initially
+        so_picking = sale.picking_ids
+        self.assertEqual(len(so_picking), 1)
+        # PO picking exists and should be waiting until sync
+        self.assertEqual(purchase.picking_ids.state, "waiting")
+        # validate SO picking partially and get a backorder
+        so_picking.with_company(so_picking.company_id).action_confirm()
+        so_picking.move_ids.quantity = 5.0
+        so_picking.move_ids.picked = True
+        res = so_picking.with_user(self.user_company_b).button_validate()
+        # A backorder wizard is hidden in res
+        wiz = (
+            self.env["stock.backorder.confirmation"]
+            .with_context(**res["context"])
+            .create({})
+        )
+        wiz.process()
+        dest_pick = so_picking.intercompany_picking_id
+        self.assertTrue(dest_pick)
+        self.assertEqual(
+            dest_pick.intercompany_picking_id,
+            so_picking,
+        )
+        # The PO receipt we mirrored into must be linked back to this SO picking.
+        self.assertEqual(dest_pick.intercompany_picking_id, so_picking)
+        # After partial validation:
+        # PO should now have 2 receipts (done + waiting)
+        # received qty should be 5
+        self.assertEqual(purchase.order_line.qty_received, 5.0)
+        self.assertEqual(len(purchase.picking_ids), 2)
+        po_done = purchase.picking_ids.filtered(lambda p: p.state == "done")
+        po_open = purchase.picking_ids.filtered(lambda p: p.state == "waiting")
+        self.assertEqual(len(po_done), 1)
+        self.assertEqual(len(po_open), 1)
+        # The mirrored picking is the one that got done by the partial delivery.
+        self.assertEqual(dest_pick, po_done)
+        # link is stable
+        self.assertEqual(so_picking.intercompany_picking_id, po_done)
+        self.assertEqual(po_done.intercompany_picking_id, so_picking)
+        # Quantities on PO side should split as 5 + 5
+        self.assertEqual(po_done.move_line_ids.quantity, 5.0)
+        self.assertEqual(po_open.move_line_ids.quantity, 5.0)
+        # validate the SO backorder for remaining qty 5
+        so_backorder = sale.picking_ids.filtered(lambda p: p.state != "done")
+        self.assertEqual(len(so_backorder), 1)
+        so_backorder.with_company(so_backorder.company_id).action_confirm()
+        so_backorder.move_ids.quantity = 5.0
+        so_backorder.move_ids.picked = True
+        so_backorder.with_user(self.user_company_b).button_validate()
+        # After validation, the SO backorder must be linked to the PO backorder receipt
+        # TRIUMPH
+        self.assertEqual(
+            so_backorder.intercompany_picking_id,
+            po_open,
+        )
+        # PO fully received and both PO pickings done -  TRIUMPH
+        self.assertEqual(purchase.order_line.qty_received, 10.0)
+        self.assertTrue(all(p.state == "done" for p in purchase.picking_ids))
+        self.assertEqual(
+            sorted(purchase.picking_ids.mapped("move_line_ids.quantity")), [5.0, 5.0]
+        )
+
+    def test_sync_picking_return_mirroring_base(self):
+        """
+        Regression test:
+        A return validated on one side of an intercompany delivery
+        must create and validate the corresponding return on the other side,
+        linking both return pickings via intercompany_picking_id.
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        self.company_b.sale_auto_validation = False  # no auto stuff now
+        # Create intercompany PO to SO
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.consumable_product
+        )
+        purchase.order_line.product_qty = 2.0
+        sale = self._approve_po(purchase)
+        # Confirm the SO explicitly in the SO's company and as the proper user
+        self.assertEqual(sale.state, "draft")
+        sale.with_company(sale.company_id).with_user(
+            self.user_company_b
+        ).action_confirm()
+        so_picking = sale.picking_ids.filtered(
+            lambda p: p.picking_type_id.code == "outgoing"
+        )
+        self.assertEqual(len(so_picking), 1)
+        # Deliver full quantity (2)
+        so_picking = so_picking.with_company(sale.company_id).with_user(
+            self.user_company_b
+        )
+        so_picking.action_confirm()
+        for move in so_picking.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        so_picking.with_user(self.user_company_b).button_validate()
+        self.assertEqual(so_picking.state, "done")
+        # delivery should be linked to a PO receipt
+        po_receipt = so_picking.intercompany_picking_id
+        self.assertTrue(po_receipt)
+        self.assertEqual(po_receipt.intercompany_picking_id, so_picking)
+        # Create a return from the SO picking for qty 1
+        wiz = (
+            self.env["stock.return.picking"]
+            .with_context(
+                active_id=so_picking.id,
+                active_ids=so_picking.ids,
+                active_model="stock.picking",
+            )
+            .create({})
+        )
+        wiz.product_return_moves.quantity = 1.0
+        # Grab the picking, as a correct company/user
+        so_return = (
+            wiz._create_return()
+            .with_company(sale.company_id)
+            .with_user(self.user_company_b)
+        )
+        self.assertEqual(len(so_return), 1)
+        self.assertNotEqual(so_return.id, so_picking.id)
+        # Validate the return picking
+        so_return.action_confirm()
+        for move in so_return.move_ids:
+            move.quantity = move.product_uom_qty  # should be 1
+            move.picked = True
+        so_return.button_validate()
+        self.assertEqual(so_return.state, "done")
+        # destination company got a mirrored return; YES
+        dest_return = so_return.intercompany_picking_id
+        self.assertTrue(dest_return, "Return picking must be mirrored and linked.")
+        self.assertEqual(dest_return.intercompany_picking_id, so_return)
+        self.assertEqual(dest_return.state, "done")
+        self.assertEqual(sum(dest_return.move_ids.mapped("quantity")), 1.0)
+
+    def test_sync_picking_return_mirroring_idempotent(self):
+        """
+        Safeguard test:
+        Mirroring a return must be idempotent.
+        If workflow allows for multiple calls
+        to _mirror_intercompany_return and _action_done,
+        we must avoid creating a second destination return picking,
+        and respect current linkage
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        self.company_b.sale_auto_validation = False
+        # Create intercompany PO to SO
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.consumable_product
+        )
+        purchase.order_line.product_qty = 2.0
+        sale = self._approve_po(purchase)
+        # Confirm the SO explicitly in the SO's company and as the proper user
+        self.assertEqual(sale.state, "draft")
+        sale.with_company(sale.company_id).with_user(
+            self.user_company_b
+        ).action_confirm()
+        so_picking = sale.picking_ids.filtered(
+            lambda p: p.picking_type_id.code == "outgoing"
+        )
+        so_picking = so_picking.with_company(sale.company_id).with_user(
+            self.user_company_b
+        )
+        self.assertEqual(len(so_picking), 1)
+        # Deliver full qty (2)
+        so_picking.action_confirm()
+        for move in so_picking.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        so_picking.button_validate()
+        self.assertEqual(so_picking.state, "done")
+        # delivery linked to PO receipt
+        po_receipt = so_picking.intercompany_picking_id
+        self.assertEqual(po_receipt.intercompany_picking_id, so_picking)
+        # Create SO return qty 1
+        wiz = (
+            self.env["stock.return.picking"]
+            .with_context(
+                active_id=so_picking.id,
+                active_ids=so_picking.ids,
+                active_model="stock.picking",
+            )
+            .create({})
+        )
+        wiz.product_return_moves.quantity = 1.0
+        so_return = (
+            wiz._create_return()
+            .with_company(sale.company_id)
+            .with_user(self.user_company_b)
+        )
+        self.assertEqual(len(so_return), 1)
+        # Validate return triggers mirroring in _action_done
+        so_return.action_confirm()
+        for move in so_return.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        so_return.button_validate()
+        self.assertEqual(so_return.state, "done")
+        # Mirror must exist
+        dest_return = so_return.intercompany_picking_id
+        self.assertEqual(dest_return.intercompany_picking_id, so_return)
+        # Count how many destination returns point back to this SO return
+        dest_company = dest_return.company_id
+        linked_before = (
+            self.env["stock.picking"]
+            .with_company(dest_company)
+            .search_count(
+                [
+                    ("company_id", "=", dest_company.id),
+                    ("intercompany_picking_id", "=", so_return.id),
+                ]
+            )
+        )
+        self.assertEqual(linked_before, 1)
+        # Call mirror again, nothing should happen
+        so_return._mirror_intercompany_return()
+        # Link must remain the same and no extra destination return created
+        self.assertEqual(so_return.intercompany_picking_id, dest_return)
+        self.assertEqual(dest_return.intercompany_picking_id, so_return)
+        linked_after = (
+            self.env["stock.picking"]
+            .with_company(dest_company)
+            .search_count(
+                [
+                    ("company_id", "=", dest_company.id),
+                    ("intercompany_picking_id", "=", so_return.id),
+                ]
+            )
+        )
+        self.assertEqual(linked_after, 1)
+
+    def test_sync_picking_return_mirroring_reuse(self):
+        """
+        Regression test:
+        If a destination return already exists and points back to the source return
+        , mirroring must REUSE it and simply
+        relink the source return, instead of creating a duplicate destination return.
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        self.company_b.sale_auto_validation = False
+
+        # Create intercompany PO to SO
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.consumable_product
+        )
+        purchase.order_line.product_qty = 2.0
+        sale = self._approve_po(purchase)
+        # Confirm SO in its company with correct user
+        self.assertEqual(sale.state, "draft")
+        sale.with_company(sale.company_id).with_user(
+            self.user_company_b
+        ).action_confirm()
+        so_picking = sale.picking_ids.filtered(
+            lambda p: p.picking_type_id.code == "outgoing"
+        )
+        so_picking = so_picking.with_company(sale.company_id).with_user(
+            self.user_company_b
+        )
+        self.assertEqual(len(so_picking), 1)
+        # Deliver full qty
+        so_picking.action_confirm()
+        for move in so_picking.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        so_picking.button_validate()
+        self.assertEqual(so_picking.state, "done")
+        # delivery linked to PO receipt
+        po_receipt = so_picking.intercompany_picking_id
+        self.assertTrue(po_receipt)
+        self.assertEqual(po_receipt.intercompany_picking_id, so_picking)
+        # Create SO return qty 1
+        wiz = (
+            self.env["stock.return.picking"]
+            .with_company(sale.company_id)
+            .with_user(self.user_company_b)
+            .with_context(
+                active_id=so_picking.id,
+                active_ids=so_picking.ids,
+                active_model="stock.picking",
+            )
+            .create({})
+        )
+        wiz.product_return_moves.quantity = 1.0
+        so_return = (
+            wiz._create_return()
+            .with_company(sale.company_id)
+            .with_user(self.user_company_b)
+        )
+        self.assertEqual(len(so_return), 1)
+        # Validate return so that mirroring happens once
+        so_return.action_confirm()
+        for move in so_return.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        so_return.button_validate()
+        self.assertEqual(so_return.state, "done")
+        dest_return = so_return.intercompany_picking_id
+        self.assertTrue(dest_return)
+        self.assertEqual(dest_return.intercompany_picking_id, so_return)
+        dest_company = dest_return.company_id
+        # fake:
+        # destination return exists and still points to src, but src lost its link.
+        so_return.intercompany_picking_id = False
+        self.assertFalse(so_return.intercompany_picking_id)
+        # must be exactly 1 destination return pointing to src
+        linked_before = (
+            self.env["stock.picking"]
+            .with_company(dest_company)
+            .search_count(
+                [
+                    ("company_id", "=", dest_company.id),
+                    ("intercompany_picking_id", "=", so_return.id),
+                ]
+            )
+        )
+        self.assertEqual(linked_before, 1)
+        # Trigger mirroring again: must relink
+        # to existing dest_return, not create a new one
+        so_return._mirror_intercompany_return()
+        self.assertEqual(so_return.intercompany_picking_id, dest_return)
+        self.assertEqual(dest_return.intercompany_picking_id, so_return)
+        # after, still exactly 1
+        linked_after = (
+            self.env["stock.picking"]
+            .with_company(dest_company)
+            .search_count(
+                [
+                    ("company_id", "=", dest_company.id),
+                    ("intercompany_picking_id", "=", so_return.id),
+                ]
+            )
+        )
+        self.assertEqual(linked_after, 1)
+
+    def test_sync_picking_return_mirroring_partial_with_backorder(self):
+        """
+        Regression test:
+        If an intercompany return is validated partially
+        (creating a return backorder),
+        each return picking must be mirrored  1 to 1 to the other company
+        with matching qty, and linked via intercompany_picking_id.
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        self.company_b.sale_auto_validation = False
+        self.partner_company_b.company_id = False
+        self.consumable_product.type = "consu"
+        # Create intercompany PO to SO for qty 5 and deliver it fully
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.consumable_product
+        )
+        purchase.order_line.product_qty = 5.0
+        sale = self._approve_po(purchase)
+        self.assertEqual(sale.state, "draft")
+        sale.with_company(sale.company_id).with_user(
+            self.user_company_b
+        ).action_confirm()
+        so_delivery = sale.picking_ids.filtered(
+            lambda p: p.picking_type_id.code == "outgoing"
+        )
+        self.assertEqual(len(so_delivery), 1)
+        so_delivery = so_delivery.with_company(sale.company_id).with_user(
+            self.user_company_b
+        )
+        so_delivery.action_confirm()
+        for move in so_delivery.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        so_delivery.button_validate()
+        self.assertEqual(so_delivery.state, "done")
+        # delivery is linked to a PO receipt
+        po_receipt = so_delivery.intercompany_picking_id
+        self.assertEqual(po_receipt.intercompany_picking_id, so_delivery)
+        # Create a return for full qty 5 from the SO delivery picking
+        wiz = (
+            self.env["stock.return.picking"]
+            .with_context(
+                active_id=so_delivery.id,
+                active_ids=so_delivery.ids,
+                active_model="stock.picking",
+            )
+            .create({})
+        )
+        # return everything so that partial validation creates a backorder
+        for line in wiz.product_return_moves:
+            line.quantity = 5.0
+        so_return = (
+            wiz._create_return()
+            .with_company(sale.company_id)
+            .with_user(self.user_company_b)
+        )
+        self.assertTrue(so_return)
+        self.assertEqual(len(so_return), 1)
+        # validate the return partially (qty 2), get a return backorder
+        so_return.action_confirm()
+        for move in so_return.move_ids:
+            move.quantity = 2.0
+            move.picked = True
+        res = so_return.button_validate()
+        wiz_bo = (
+            self.env["stock.backorder.confirmation"]
+            .with_context(**res["context"])
+            .create({})
+        )
+        wiz_bo.process()
+        self.assertEqual(so_return.state, "done")
+        # (mirrored) return 1 must exist and be done with qty 2
+        dest_return_1 = so_return.intercompany_picking_id
+        self.assertEqual(dest_return_1.intercompany_picking_id, so_return)
+        self.assertEqual(dest_return_1.state, "done")
+        self.assertEqual(sum(dest_return_1.move_ids.mapped("quantity")), 2.0)
+        # validate the SO return backorder (remaining qty 3)
+        so_return_bo = sale.picking_ids.filtered(lambda p: p.state != "done")
+        # find backorder picking from backorder_id
+        so_return_bo = self.env["stock.picking"].search(
+            [("backorder_id", "=", so_return.id), ("state", "!=", "done")],
+            limit=1,
+        )
+        self.assertTrue(so_return_bo)
+        so_return_bo.action_confirm()
+        for move in so_return_bo.move_ids:
+            move.quantity = move.product_uom_qty  # should be 3
+            move.picked = True
+        so_return_bo.with_user(self.user_company_b).button_validate()
+        self.assertEqual(so_return_bo.state, "done")
+        # return 2 must exist and be done with qty 3
+        dest_return_2 = so_return_bo.intercompany_picking_id
+        self.assertEqual(dest_return_2.intercompany_picking_id, so_return_bo)
+        self.assertEqual(dest_return_2.state, "done")
+        self.assertEqual(sum(dest_return_2.move_ids.mapped("quantity")), 3.0)
+        # Both mirrored return pickings must be distinct
+        self.assertNotEqual(dest_return_1.id, dest_return_2.id)
+
+    def test_sync_picking_return_mirroring_multi_step_with_transit_backorder(self):
+        """
+        Regression test:
+        In intercompany flows using transit locations and multi-step routes,
+        a partial return (creating a backorder) must be mirrored to the other company,
+        and the return backorder must also be mirrored and linked 1 to 1 via
+        intercompany_picking_id.
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        # Multi-step and transit setup
+        self.warehouse_a.reception_steps = "two_steps"
+        self.warehouse_c.delivery_steps = "pick_ship"
+        interco_location = self.env.ref("stock.stock_location_inter_company")
+        self.partner_company_b.with_company(self.company_a).write(
+            {
+                "property_stock_customer": interco_location.id,
+                "property_stock_supplier": interco_location.id,
+            }
+        )
+        self.partner_company_a.with_company(self.company_b).write(
+            {
+                "property_stock_customer": interco_location.id,
+                "property_stock_supplier": interco_location.id,
+            }
+        )
+        # Create intecompany PO to SO with qty 2
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.consumable_product
+        )
+        purchase.order_line.product_qty = 2.0
+        sale = self._approve_po(purchase)
+        # Auto validatiop is on, so state is sale
+        # SO is validated fully so we have a done customer delivery picking.
+        self.assertEqual(sale.state, "sale")
+        # In pick/ship, the outgoing delivery is typically created only AFTER
+        # validating the internal picking. Validate internal first, then fetch
+        # the next transfer (outgoing).
+        so_pick = sale.picking_ids.filtered(
+            lambda p: p.picking_type_id.code == "internal"
+        )
+        self.assertEqual(len(so_pick), 1)
+        so_pick = so_pick.with_company(sale.company_id).with_user(self.user_company_b)
+        so_pick.action_confirm()
+        for move in so_pick.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        so_pick.button_validate()
+        self.assertEqual(so_pick.state, "done")
+        so_delivery_pick = so_pick._get_next_transfers()
+        so_delivery_pick = so_delivery_pick.with_company(sale.company_id).with_user(
+            self.user_company_b
+        )
+        self.assertEqual(len(so_delivery_pick), 1)
+        so_delivery_pick.action_confirm()
+        for move in so_delivery_pick.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        so_delivery_pick.button_validate()
+        self.assertEqual(so_delivery_pick.state, "done")
+        # Create RETURN with partial quantity 1, get a return backorder
+        wiz = (
+            self.env["stock.return.picking"]
+            .with_context(
+                active_id=so_delivery_pick.id,
+                active_ids=so_delivery_pick.ids,
+                active_model="stock.picking",
+            )
+            .create({})
+        )
+        # Create a return for the FULL qty (2).
+        # The backorder is created by validating the return picking partially.
+        wiz.product_return_moves.quantity = 2.0
+        so_return_1 = wiz._create_return()
+        so_return_1 = so_return_1.with_company(sale.company_id).with_user(
+            self.user_company_b
+        )
+        self.assertTrue(so_return_1)
+        so_return_1.action_confirm()
+        for move in so_return_1.move_ids:
+            # Validate only 1 out of 2 to force a return backorder
+            move.quantity = 1.0
+            move.picked = True
+        res = so_return_1.button_validate()
+        # there's a backorder wizard lurking in context
+        bwiz = (
+            self.env["stock.backorder.confirmation"]
+            .with_context(**res["context"])
+            .create({})
+        )
+        bwiz.process()
+        self.assertEqual(so_return_1.state, "done")
+        # Assert mirrored return exists and is linked
+        dest_return_1 = so_return_1.intercompany_picking_id
+        self.assertEqual(dest_return_1.intercompany_picking_id, so_return_1)
+        self.assertEqual(dest_return_1.state, "done")
+        self.assertEqual(sum(dest_return_1.move_ids.mapped("quantity")), 1.0)
+        # -Validate RETURN backorder (remaining qty 1)
+        # Find the return backorder via backorder link
+        so_return_back = self.env["stock.picking"].search(
+            [
+                ("backorder_id", "=", so_return_1.id),
+                ("state", "!=", "done"),
+            ],
+            limit=1,
+        )
+        self.assertTrue(so_return_back)
+        so_return_back.action_confirm()
+        for move in so_return_back.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        so_return_back.with_user(self.user_company_b).button_validate()
+        self.assertEqual(so_return_back.state, "done")
+        # Assert mirrored return backorder exists and is linked
+        dest_return_back = so_return_back.intercompany_picking_id
+        self.assertEqual(dest_return_back.intercompany_picking_id, so_return_back)
+        self.assertEqual(dest_return_back.state, "done")
+        self.assertEqual(sum(dest_return_back.move_ids.mapped("quantity")), 1.0)
+
+    def test_sync_picking_return_multiple_intercompany_origins_skipped(self):
+        """
+        Regression test:
+        If a single return picking contains moves originating from multiple
+        intercompany deliveries, return mirroring must be skipped
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        self.company_b.sale_auto_validation = False
+        StockMove = self.env["stock.move"]
+        # Create TWO intercompany flows
+        purchase1 = self._create_purchase_order(
+            self.partner_company_b, self.consumable_product
+        )
+        purchase2 = self._create_purchase_order(
+            self.partner_company_b, self.consumable_product
+        )
+        purchase1.order_line.product_qty = 2.0
+        purchase2.order_line.product_qty = 2.0
+        sale1 = self._approve_po(purchase1)
+        sale2 = self._approve_po(purchase2)
+        self.assertEqual(sale1.state, "draft")
+        self.assertEqual(sale2.state, "draft")
+        sale1.with_company(sale1.company_id).with_user(
+            self.user_company_b
+        ).action_confirm()
+        sale2.with_company(sale1.company_id).with_user(
+            self.user_company_b
+        ).action_confirm()
+        pick1 = sale1.picking_ids.filtered(
+            lambda p: p.picking_type_id.code == "outgoing"
+        )[:1]
+        self.assertTrue(pick1)
+        # Deliver the first intercompany picking (true origin)
+        pick1.action_confirm()
+        for move in pick1.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        pick1.with_user(self.user_company_b).button_validate()
+        self.assertEqual(pick1.state, "done")
+        self.assertTrue(pick1.intercompany_picking_id)
+        # Create a return from pick1
+        # enforce company context, otherwise Odoo may create a return
+        # in the "current" company while linking to records
+        # from another company, and _check_company() will definitely complain
+        ReturnWiz = (
+            self.env["stock.return.picking"]
+            .with_company(pick1.company_id)
+            .with_user(self.user_company_b)
+            .with_context(
+                active_id=pick1.id,
+                active_ids=pick1.ids,
+                active_model="stock.picking",
+            )
+        )
+        wiz = ReturnWiz.create({})
+        wiz.product_return_moves.quantity = 1.0
+        ret = wiz._create_return().with_company(pick1.company_id)
+        self.assertEqual(len(ret), 1)
+        self.assertEqual(ret.company_id, pick1.company_id)
+        # Create a SECOND origin delivery picking in the SAME company as pick1
+        # We want another move with origin_returned_move_id in company B,
+        # but still intercompany-linked, so that multiple intercompany
+        # origins exist and mirroring is skipped.
+        pick2 = sale2.picking_ids.filtered(
+            lambda p: p.picking_type_id.code == "outgoing"
+            and p.company_id == pick1.company_id
+        )[:1]
+        self.assertTrue(pick2)
+        pick2.action_confirm()
+        for move in pick2.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        pick2.with_user(self.user_company_b).button_validate()
+        self.assertEqual(pick2.state, "done")
+        self.assertTrue(pick2.intercompany_picking_id)
+        # Inject an extra return move pointing to an origin move from pick2
+        move2 = pick2.move_ids[:1]
+        self.assertEqual(move2.company_id, ret.company_id)
+        # create the move in the correct company
+        StockMove.sudo().with_company(ret.company_id).create(
+            {
+                "name": move2.name,
+                "product_id": move2.product_id.id,
+                "product_uom": move2.product_uom.id,
+                "product_uom_qty": 1.0,
+                "location_id": ret.location_id.id,
+                "location_dest_id": ret.location_dest_id.id,
+                "picking_id": ret.id,
+                "origin_returned_move_id": move2.id,
+                "company_id": ret.company_id.id,
+            }
+        )
+        # Validate return
+        # sudo here, return is in pick1.company_id,
+        # but user_company_b may not have rights
+        ret = ret.sudo().with_company(pick1.company_id)
+        ret.action_confirm()
+        for move in ret.move_ids:
+            move.quantity = move.product_uom_qty
+            move.picked = True
+        ret.button_validate()
+        # Mirroring is skipped YES
+        # 2026-02-04 14:20:42,728 353353 WARNING eighteen
+        # odoo.addons.purchase_sale_stock_inter_company.models.stock_picking:
+        # Intercompany return mirroring skipped for picking Compa/IN/00007:
+        # multiple intercompany origin pickings found: Compa/OUT/00024, Compa/OUT/00025
+        self.assertFalse(
+            ret.intercompany_picking_id,
+        )
+
+    def test_sync_picking_return_mirroring_serial_lots(self):
+        """
+        Regression test:
+        For tracked products (serial/lot), return mirroring must also mirror the
+        lot/serial numbers to the other company.
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        self.company_b.sale_auto_validation = False
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.stockable_product_serial
+        )
+        purchase.order_line.product_qty = 2.0
+        sale = self._approve_po(purchase)
+        self.assertEqual(sale.state, "draft")
+        sale.with_company(sale.company_id).with_user(
+            self.user_company_b
+        ).action_confirm()
+        so_delivery = sale.picking_ids.filtered(
+            lambda p: p.picking_type_id.code == "outgoing"
+        )
+        self.assertEqual(len(so_delivery), 1)
+        so_move = so_delivery.move_ids
+        self.assertEqual(len(so_move), 1)
+        # Deliver 2 serials.
+        so_move.move_line_ids = [
+            Command.clear(),
+            Command.create(
+                {
+                    "location_id": so_move.location_id.id,
+                    "location_dest_id": so_move.location_dest_id.id,
+                    "product_id": self.stockable_product_serial.id,
+                    "product_uom_id": self.stockable_product_serial.uom_id.id,
+                    "quantity": 1,
+                    "lot_id": self.serial_2.id,
+                    "picking_id": so_delivery.id,
+                },
+            ),
+            Command.create(
+                {
+                    "location_id": so_move.location_id.id,
+                    "location_dest_id": so_move.location_dest_id.id,
+                    "product_id": self.stockable_product_serial.id,
+                    "product_uom_id": self.stockable_product_serial.uom_id.id,
+                    "quantity": 1,
+                    "lot_id": self.serial_3.id,
+                    "picking_id": so_delivery.id,
+                },
+            ),
+        ]
+        so_delivery.action_confirm()
+        so_delivery.with_user(self.user_company_b).button_validate()
+        self.assertEqual(so_delivery.state, "done")
+        po_receipt = so_delivery.intercompany_picking_id
+        self.assertTrue(po_receipt)
+        # Create a return for qty 1 and explicitly pick ONE serial.
+        wiz = (
+            self.env["stock.return.picking"]
+            .with_context(
+                active_id=so_delivery.id,
+                active_ids=so_delivery.ids,
+                active_model="stock.picking",
+            )
+            .create({})
+        )
+        wiz.product_return_moves.quantity = 1.0
+        so_return = wiz._create_return()
+        self.assertTrue(so_return)
+        so_return = so_return[0]
+        so_return.action_confirm()
+        ret_move = so_return.move_ids
+        self.assertEqual(len(ret_move), 1)
+        ret_move.move_line_ids = [
+            Command.clear(),
+            Command.create(
+                {
+                    "location_id": ret_move.location_id.id,
+                    "location_dest_id": ret_move.location_dest_id.id,
+                    "product_id": self.stockable_product_serial.id,
+                    "product_uom_id": self.stockable_product_serial.uom_id.id,
+                    "quantity": 1,
+                    "lot_id": self.serial_2.id,
+                    "picking_id": so_return.id,
+                },
+            ),
+        ]
+        so_return.with_user(self.user_company_b).button_validate()
+        self.assertEqual(so_return.state, "done")
+        dest_return = so_return.intercompany_picking_id
+        self.assertEqual(dest_return.state, "done")
+        self.assertEqual(sum(dest_return.move_line_ids.mapped("quantity")), 1.0)
+        self.assertEqual(
+            dest_return.move_line_ids.lot_id.mapped("name"),
+            [self.serial_2.name],
+        )
