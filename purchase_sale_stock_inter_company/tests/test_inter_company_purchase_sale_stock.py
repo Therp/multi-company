@@ -104,6 +104,15 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
             cls.stockable_product_serial, "555", cls.company_b
         )
 
+    def _set_inter_company_locations(self, location):
+        """Use ``location`` as customer/supplier location on both company partners."""
+        vals = {
+            "property_stock_customer": location.id,
+            "property_stock_supplier": location.id,
+        }
+        self.partner_company_b.with_company(self.company_a).write(vals)
+        self.partner_company_a.with_company(self.company_b).write(vals)
+
     def test_deliver_to_warehouse_a(self):
         self.purchase_company_a.picking_type_id = self.warehouse_a.in_type_id
         sale = self._approve_po()
@@ -335,41 +344,12 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         so_picking_id = sale.picking_ids
 
         so_move = so_picking_id.move_ids
+        move_line_vals = so_move._prepare_move_line_vals()
         so_move.move_line_ids = [
             Command.clear(),
-            Command.create(
-                {
-                    "location_id": so_move.location_id.id,
-                    "location_dest_id": so_move.location_dest_id.id,
-                    "product_id": self.stockable_product_serial.id,
-                    "product_uom_id": self.stockable_product_serial.uom_id.id,
-                    "quantity": 1,
-                    "lot_id": self.serial_1.id,
-                    "picking_id": so_picking_id.id,
-                },
-            ),
-            Command.create(
-                {
-                    "location_id": so_move.location_id.id,
-                    "location_dest_id": so_move.location_dest_id.id,
-                    "product_id": self.stockable_product_serial.id,
-                    "product_uom_id": self.stockable_product_serial.uom_id.id,
-                    "quantity": 1,
-                    "lot_id": self.serial_2.id,
-                    "picking_id": so_picking_id.id,
-                },
-            ),
-            Command.create(
-                {
-                    "location_id": so_move.location_id.id,
-                    "location_dest_id": so_move.location_dest_id.id,
-                    "product_id": self.stockable_product_serial.id,
-                    "product_uom_id": self.stockable_product_serial.uom_id.id,
-                    "quantity": 1,
-                    "lot_id": self.serial_3.id,
-                    "picking_id": so_picking_id.id,
-                },
-            ),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_1.id)),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_2.id)),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_3.id)),
         ]
         so_picking_id.button_validate()
 
@@ -419,19 +399,7 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.company_b.sync_picking = True
         # Set inter-company locations on partners
         interco_location = self.env.ref("stock.stock_location_inter_company")
-        self.partner_company_b.with_company(self.company_a).write(
-            {
-                "property_stock_customer": interco_location.id,
-                "property_stock_supplier": interco_location.id,
-            }
-        )
-        self.partner_company_a.with_company(self.company_b).write(
-            {
-                "property_stock_customer": interco_location.id,
-                "property_stock_supplier": interco_location.id,
-            }
-        )
-
+        self._set_inter_company_locations(interco_location)
         purchase = self._create_purchase_order(
             self.partner_company_b, self.stockable_product_serial
         )
@@ -442,41 +410,12 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         so_picking_id = sale.picking_ids
 
         so_move = so_picking_id.move_ids
+        move_line_vals = so_move._prepare_move_line_vals()
         so_move.move_line_ids = [
             Command.clear(),
-            Command.create(
-                {
-                    "location_id": so_move.location_id.id,
-                    "location_dest_id": so_move.location_dest_id.id,
-                    "product_id": self.stockable_product_serial.id,
-                    "product_uom_id": self.stockable_product_serial.uom_id.id,
-                    "quantity": 1,
-                    "lot_id": self.serial_1.id,
-                    "picking_id": so_picking_id.id,
-                },
-            ),
-            Command.create(
-                {
-                    "location_id": so_move.location_id.id,
-                    "location_dest_id": so_move.location_dest_id.id,
-                    "product_id": self.stockable_product_serial.id,
-                    "product_uom_id": self.stockable_product_serial.uom_id.id,
-                    "quantity": 1,
-                    "lot_id": self.serial_2.id,
-                    "picking_id": so_picking_id.id,
-                },
-            ),
-            Command.create(
-                {
-                    "location_id": so_move.location_id.id,
-                    "location_dest_id": so_move.location_dest_id.id,
-                    "product_id": self.stockable_product_serial.id,
-                    "product_uom_id": self.stockable_product_serial.uom_id.id,
-                    "quantity": 1,
-                    "lot_id": self.serial_3.id,
-                    "picking_id": so_picking_id.id,
-                },
-            ),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_1.id)),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_2.id)),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_3.id)),
         ]
         so_picking_id.button_validate()
         self.assertEqual(so_picking_id.location_id.usage, "internal")
@@ -723,18 +662,7 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.warehouse_c.delivery_steps = "pick_ship"
         # Set inter-company locations on partners
         interco_location = self.env.ref("stock.stock_location_inter_company")
-        self.partner_company_b.with_company(self.company_a).write(
-            {
-                "property_stock_customer": interco_location.id,
-                "property_stock_supplier": interco_location.id,
-            }
-        )
-        self.partner_company_a.with_company(self.company_b).write(
-            {
-                "property_stock_customer": interco_location.id,
-                "property_stock_supplier": interco_location.id,
-            }
-        )
+        self._set_inter_company_locations(interco_location)
         purchase = self._create_purchase_order(
             self.partner_company_b, self.stockable_product_serial
         )
@@ -753,41 +681,12 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         # validate the SO internal picking
         so_internal_pick = sale.picking_ids
         so_move = so_internal_pick.move_ids
+        move_line_vals = so_move._prepare_move_line_vals()
         so_move.move_line_ids = [
             Command.clear(),
-            Command.create(
-                {
-                    "location_id": so_move.location_id.id,
-                    "location_dest_id": so_move.location_dest_id.id,
-                    "product_id": self.stockable_product_serial.id,
-                    "product_uom_id": self.stockable_product_serial.uom_id.id,
-                    "quantity": 1,
-                    "lot_id": self.serial_1.id,
-                    "picking_id": so_internal_pick.id,
-                },
-            ),
-            Command.create(
-                {
-                    "location_id": so_move.location_id.id,
-                    "location_dest_id": so_move.location_dest_id.id,
-                    "product_id": self.stockable_product_serial.id,
-                    "product_uom_id": self.stockable_product_serial.uom_id.id,
-                    "quantity": 1,
-                    "lot_id": self.serial_2.id,
-                    "picking_id": so_internal_pick.id,
-                },
-            ),
-            Command.create(
-                {
-                    "location_id": so_move.location_id.id,
-                    "location_dest_id": so_move.location_dest_id.id,
-                    "product_id": self.stockable_product_serial.id,
-                    "product_uom_id": self.stockable_product_serial.uom_id.id,
-                    "quantity": 1,
-                    "lot_id": self.serial_3.id,
-                    "picking_id": so_internal_pick.id,
-                },
-            ),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_1.id)),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_2.id)),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_3.id)),
         ]
         so_internal_pick.with_user(self.user_company_b).button_validate()
         self.assertEqual(so_internal_pick.state, "done")
@@ -1703,3 +1602,149 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
             dest_return.move_line_ids.lot_id.mapped("name"),
             [self.serial_2.name],
         )
+
+    def test_full_return_with_lot(self):
+        """
+        Test that the lot is synchronized on the moves
+        when using inter-company transit locations
+        company B: Sale picking from Stock to Transit Location
+        company A: Purchase picking from Transit Location to Stock
+        Returned the picking
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        # Set inter-company locations on partners
+        interco_location = self.env.ref("stock.stock_location_inter_company")
+        self._set_inter_company_locations(interco_location)
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.stockable_product_serial
+        )
+        sale = self._approve_po(purchase)
+        po_picking = purchase.picking_ids
+        so_picking = sale.picking_ids
+        so_move = so_picking.move_ids
+        move_line_vals = so_move._prepare_move_line_vals()
+        so_move.move_line_ids = [
+            Command.clear(),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_1.id)),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_2.id)),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_3.id)),
+        ]
+        so_picking.button_validate()
+        self.assertEqual(so_picking.location_id.usage, "internal")
+        self.assertEqual(so_picking.location_dest_id.usage, "transit")
+        self.assertEqual(po_picking.location_id.usage, "transit")
+        self.assertEqual(po_picking.location_dest_id.usage, "internal")
+        so_lots = so_picking.move_line_ids.lot_id
+        po_lots = po_picking.move_line_ids.lot_id
+        self.assertEqual(so_lots, po_lots)
+        self.assertFalse(so_lots.company_id)
+        return_wizard = self.env["stock.return.picking"].create(
+            {"picking_id": so_picking.id}
+        )
+        action = return_wizard.action_create_returns_all()
+        so_return = self.env["stock.picking"].browse(action["res_id"])
+        po_return = po_picking.return_ids
+        self.assertEqual(len(purchase.picking_ids), 2)
+        self.assertEqual(len(sale.picking_ids), 2)
+        self.assertEqual(po_picking.return_count, 1)
+        self.assertEqual(so_picking.return_count, 1)
+        self.assertEqual(po_return.state, "assigned")
+        self.assertEqual(so_return.state, "assigned")
+        so_return.button_validate()
+        self.assertEqual(po_return.state, "done")
+        self.assertEqual(so_return.state, "done")
+        so_return_lots = so_return.move_line_ids.lot_id
+        po_return_lots = po_return.move_line_ids.lot_id
+        self.assertEqual(so_return_lots, po_return_lots)
+        self.assertEqual(so_return_lots, so_lots)
+
+    def test_partial_return_with_lot(self):
+        """
+        Test that the lot is synchronized on the moves
+        when using inter-company transit locations
+        company B: Sale picking from Stock to Transit Location
+        company A: Purchase picking from Transit Location to Stock
+        Returned the picking
+        """
+        self.company_a.sync_picking = True
+        self.company_b.sync_picking = True
+        # Set inter-company locations on partners
+        interco_location = self.env.ref("stock.stock_location_inter_company")
+        self._set_inter_company_locations(interco_location)
+        purchase = self._create_purchase_order(
+            self.partner_company_b, self.stockable_product_serial
+        )
+        sale = self._approve_po(purchase)
+        po_picking = purchase.picking_ids
+        so_picking = sale.picking_ids
+        so_move = so_picking.move_ids
+        move_line_vals = so_move._prepare_move_line_vals()
+        so_move.move_line_ids = [
+            Command.clear(),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_1.id)),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_2.id)),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_3.id)),
+        ]
+        so_picking.button_validate()
+        self.assertEqual(so_picking.location_id.usage, "internal")
+        self.assertEqual(so_picking.location_dest_id.usage, "transit")
+        self.assertEqual(po_picking.location_id.usage, "transit")
+        self.assertEqual(po_picking.location_dest_id.usage, "internal")
+        so_lots = so_picking.move_line_ids.lot_id
+        po_lots = po_picking.move_line_ids.lot_id
+        self.assertEqual(so_lots, po_lots)
+        self.assertFalse(so_lots.company_id)
+        # Generate a first return for 2 products, and validate it
+        return_wizard = self.env["stock.return.picking"].create(
+            {"picking_id": so_picking.id}
+        )
+        return_wizard.product_return_moves.quantity = 2
+        action = return_wizard.action_create_returns()
+        so_return = self.env["stock.picking"].browse(action["res_id"])
+        po_return = po_picking.return_ids
+        self.assertEqual(len(purchase.picking_ids), 2)
+        self.assertEqual(len(sale.picking_ids), 2)
+        self.assertEqual(po_picking.return_count, 1)
+        self.assertEqual(so_picking.return_count, 1)
+        self.assertEqual(po_return.state, "assigned")
+        self.assertEqual(so_return.state, "assigned")
+        move_line_vals = so_return.move_ids._prepare_move_line_vals()
+        so_return.move_ids.move_line_ids = [
+            Command.clear(),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_1.id)),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_2.id)),
+        ]
+        so_return.button_validate()
+        self.assertEqual(po_return.state, "done")
+        self.assertEqual(so_return.state, "done")
+        so_return_lots = so_return.move_line_ids.lot_id
+        po_return_lots = po_return.move_line_ids.lot_id
+        self.assertEqual(so_return_lots, po_return_lots)
+        self.assertNotIn(self.serial_3, so_return_lots)
+        # Generate a second return
+        return_wizard = self.env["stock.return.picking"].create(
+            {"picking_id": so_picking.id}
+        )
+        return_wizard.product_return_moves.quantity = 1
+        action = return_wizard.action_create_returns()
+        so_return2 = self.env["stock.picking"].browse(action["res_id"])
+        po_return2 = po_picking.return_ids - po_return
+        self.assertEqual(len(purchase.picking_ids), 3)
+        self.assertEqual(len(sale.picking_ids), 3)
+        self.assertEqual(po_picking.return_count, 2)
+        self.assertEqual(so_picking.return_count, 2)
+        self.assertEqual(po_return2.state, "assigned")
+        self.assertEqual(so_return2.state, "assigned")
+        move_line_vals = so_return2.move_ids._prepare_move_line_vals()
+        so_return2.move_ids.move_line_ids = [
+            Command.clear(),
+            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_3.id)),
+        ]
+        so_return2.button_validate()
+        self.assertEqual(po_return2.state, "done")
+        self.assertEqual(so_return2.state, "done")
+        so_return2_lots = so_return2.move_line_ids.lot_id
+        po_return2_lots = po_return2.move_line_ids.lot_id
+        self.assertEqual(so_return2_lots, po_return2_lots)
+        self.assertEqual(self.serial_3, so_return2_lots)

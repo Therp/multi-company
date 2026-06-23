@@ -45,7 +45,10 @@ class StockPicking(models.Model):
         # Block manual validation of intercompany receipts when the flag is set.
         if self.filtered(
             lambda picking: picking.company_id.block_po_manual_picking_validation
-            and picking._is_intercompany_reception()
+            and (
+                picking._is_intercompany_reception()
+                or picking._is_intercompany_return_delivery()
+            )
             and picking.state in ["done", "waiting", "assigned"]
         ):
             raise UserError(
@@ -59,8 +62,11 @@ class StockPicking(models.Model):
     def _action_done(self):
         res = super()._action_done()
         # Sync intercompany receipts for DropShip pickings
-        # (delivery → customer/transit).
-        for picking in self.filtered(lambda pick: pick._is_intercompany_delivery()):
+        # (delivery → customer/transit) and for return receptions of such deliveries.
+        for picking in self.filtered(
+            lambda pick: pick._is_intercompany_delivery()
+            or pick._is_intercompany_return_reception()
+        ):
             purchase = picking.sale_id.sudo().auto_purchase_order_id
             picking.sudo()._action_done_intercompany_actions(purchase)
         # Mirror intercompany returns (context key prevents infinite recursion).
@@ -98,7 +104,9 @@ class StockPicking(models.Model):
                 # vendor locations bypass reservations, but transit locations require
                 # move lines for lot/serial assignment.
                 if not po_move_pending or (
-                    not po_move_lines and move.location_dest_id.usage != "transit"
+                    not po_move_lines
+                    and move.location_dest_id.usage != "transit"
+                    and not self._is_intercompany_return_reception()
                 ):
                     raise UserError(
                         self.env._(
@@ -414,7 +422,8 @@ class StockPicking(models.Model):
         by an intercompany sale order on the other side.
         """
         return (
-            self.location_id.usage in ["supplier", "transit"]
+            not self.return_id
+            and self.location_id.usage in ["supplier", "transit"]
             and self.purchase_id.sudo().intercompany_sale_order_id
         )
 
@@ -424,7 +433,8 @@ class StockPicking(models.Model):
         to an auto-generated purchase order in another company.
         """
         return (
-            self.location_dest_id.usage in ["customer", "transit"]
+            not self.return_id
+            and self.location_dest_id.usage in ["customer", "transit"]
             and self.sale_id.sudo().auto_purchase_order_id
         )
 
@@ -437,3 +447,25 @@ class StockPicking(models.Model):
         if self.intercompany_picking_id:
             return False
         return bool(self._get_intercompany_return_origin_picking())
+
+    def _is_intercompany_return_reception(self):
+        """
+        Check if the picking is an inter-company return reception.
+        :return: bool
+        """
+        return (
+            self.return_id
+            and self.location_id.usage in ["supplier", "transit"]
+            and self.return_id._is_intercompany_delivery()
+        )
+
+    def _is_intercompany_return_delivery(self):
+        """
+        Check if the picking is an inter-company return delivery.
+        :return: bool
+        """
+        return (
+            self.return_id
+            and self.location_dest_id.usage in ["customer", "transit"]
+            and self.return_id._is_intercompany_reception()
+        )
