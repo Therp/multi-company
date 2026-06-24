@@ -7,6 +7,7 @@
 
 from odoo import Command
 from odoo.exceptions import UserError
+from odoo.tools import mute_logger
 
 from odoo.addons.purchase_sale_inter_company.tests import (
     test_inter_company_purchase_sale as test_icps,
@@ -1603,6 +1604,7 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
             [self.serial_2.name],
         )
 
+    @mute_logger("odoo.models.unlink")
     def test_full_return_with_lot(self):
         """
         Test that the lot is synchronized on the moves
@@ -1659,6 +1661,7 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.assertEqual(so_return_lots, po_return_lots)
         self.assertEqual(so_return_lots, so_lots)
 
+    @mute_logger("odoo.models.unlink")
     def test_partial_return_with_lot(self):
         """
         Test that the lot is synchronized on the moves
@@ -1699,7 +1702,12 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         return_wizard = self.env["stock.return.picking"].create(
             {"picking_id": so_picking.id}
         )
-        return_wizard.product_return_moves.quantity = 2
+        if "lot_id" in return_wizard.product_return_moves._fields:
+            return_wizard.product_return_moves.filtered(
+                lambda x: x.lot_id == self.serial_3
+            ).unlink()
+        else:
+            return_wizard.product_return_moves.quantity = 2
         action = return_wizard.action_create_returns()
         so_return = self.env["stock.picking"].browse(action["res_id"])
         po_return = po_picking.return_ids
@@ -1709,12 +1717,17 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.assertEqual(so_picking.return_count, 1)
         self.assertEqual(po_return.state, "assigned")
         self.assertEqual(so_return.state, "assigned")
-        move_line_vals = so_return.move_ids._prepare_move_line_vals()
-        so_return.move_ids.move_line_ids = [
-            Command.clear(),
-            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_1.id)),
-            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_2.id)),
-        ]
+        if "restrict_lot_id" not in so_return.move_ids._fields:
+            move_line_vals = so_return.move_ids._prepare_move_line_vals()
+            so_return.move_ids.move_line_ids = [
+                Command.clear(),
+                Command.create(
+                    dict(move_line_vals, quantity=1, lot_id=self.serial_1.id)
+                ),
+                Command.create(
+                    dict(move_line_vals, quantity=1, lot_id=self.serial_2.id)
+                ),
+            ]
         so_return.button_validate()
         self.assertEqual(po_return.state, "done")
         self.assertEqual(so_return.state, "done")
@@ -1726,7 +1739,12 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         return_wizard = self.env["stock.return.picking"].create(
             {"picking_id": so_picking.id}
         )
-        return_wizard.product_return_moves.quantity = 1
+        if "lot_id" in return_wizard.product_return_moves._fields:
+            return_wizard.product_return_moves.filtered(
+                lambda x: x.lot_id != self.serial_3
+            ).unlink()
+        else:
+            return_wizard.product_return_moves.quantity = 1
         action = return_wizard.action_create_returns()
         so_return2 = self.env["stock.picking"].browse(action["res_id"])
         po_return2 = po_picking.return_ids - po_return
@@ -1736,11 +1754,14 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         self.assertEqual(so_picking.return_count, 2)
         self.assertEqual(po_return2.state, "assigned")
         self.assertEqual(so_return2.state, "assigned")
-        move_line_vals = so_return2.move_ids._prepare_move_line_vals()
-        so_return2.move_ids.move_line_ids = [
-            Command.clear(),
-            Command.create(dict(move_line_vals, quantity=1, lot_id=self.serial_3.id)),
-        ]
+        if "restrict_lot_id" not in so_return.move_ids._fields:
+            move_line_vals = so_return2.move_ids._prepare_move_line_vals()
+            so_return2.move_ids.move_line_ids = [
+                Command.clear(),
+                Command.create(
+                    dict(move_line_vals, quantity=1, lot_id=self.serial_3.id)
+                ),
+            ]
         so_return2.button_validate()
         self.assertEqual(po_return2.state, "done")
         self.assertEqual(so_return2.state, "done")

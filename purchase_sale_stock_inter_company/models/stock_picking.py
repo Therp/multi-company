@@ -327,17 +327,27 @@ class StockPicking(models.Model):
         """
         StockMove = self.env["stock.move"]
         po_move = StockMove
+
+        def _same_restricted_lot(move):
+            # stock_restrict_lot compatibility: only mirror into a receipt move
+            # restricted to the same lot as the delivery move (if any).
+            if "restrict_lot_id" in move._fields:
+                return move.restrict_lot_id == src_move.restrict_lot_id
+            return True
+
         sale_line = src_move.sale_line_id
         po_line = sale_line.auto_purchase_line_id if sale_line else False
         if po_line:
             po_move = po_line.move_ids.filtered(
                 lambda m, ic_pick=dest_picking: m.picking_id == ic_pick
                 and m.state not in ["done", "cancel"]
+                and _same_restricted_lot(m)
             )[:1]
         if not po_move:
             candidates = dest_picking.move_ids.filtered(
                 lambda m: m.product_id == src_move.product_id
                 and m.state not in ["done", "cancel"]
+                and _same_restricted_lot(m)
             )
             if len(candidates) > 1:
                 raise UserError(
