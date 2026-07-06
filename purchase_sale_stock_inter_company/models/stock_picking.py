@@ -96,7 +96,7 @@ class StockPicking(models.Model):
             dest_picking = dest_pick.with_user(intercompany_user).with_company(
                 dest_company
             )
-            for move in self.move_ids:
+            for move in self.move_ids.filtered(lambda m: m.state != "cancel"):
                 move_lines = move.move_line_ids.filtered(lambda x: x.quantity > 0)
                 po_move_pending = self._get_intercompany_po_move(move, dest_picking)
                 po_move_lines = po_move_pending.move_line_ids
