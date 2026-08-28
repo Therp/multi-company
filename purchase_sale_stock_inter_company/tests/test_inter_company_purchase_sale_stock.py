@@ -1504,8 +1504,15 @@ class TestPurchaseSaleStockInterCompany(TestPurchaseSaleInterCompany):
         # odoo.addons.purchase_sale_stock_inter_company.models.stock_picking:
         # Intercompany return mirroring skipped for picking Compa/IN/00007:
         # multiple intercompany origin pickings found: Compa/OUT/00024, Compa/OUT/00025
-        self.assertFalse(
-            ret.intercompany_picking_id,
+        # The counterpart created by the return wizard is left untouched (pending).
+        counterpart = ret.intercompany_picking_id.sudo()
+        self.assertTrue(counterpart)
+        self.assertNotEqual(counterpart.state, "done")
+        self.assertEqual(
+            self.env["stock.picking"]
+            .sudo()
+            .search_count([("intercompany_picking_id", "=", ret.id)]),
+            1,
         )
 
     def test_sync_picking_return_mirroring_serial_lots(self):
