@@ -148,7 +148,11 @@ class AccountMove(models.Model):
         :rtype dest_company : res.company record
         """
         self.ensure_one()
-        self = self.with_context(check_move_validity=False)
+        # drop default_* keys (e.g. from sale's action_view_invoice), they
+        # would otherwise end up on the destination invoice
+        self = self.with_context(
+            clean_context(self.env.context), check_move_validity=False
+        )
         # check intercompany product
         self._check_intercompany_product(dest_company)
         # if an invoice has already been generated

@@ -412,6 +412,17 @@ class TestAccountInvoiceInterCompany(TestAccountInvoiceInterCompanyBase):
         )
         self.assertEqual(len(invoices), 1)
 
+    def test_no_propagation_of_default_partner_shipping(self):
+        # Invoices opened from a sale order carry default_partner_shipping_id
+        # (the customer's address); it must not end up on the vendor bill
+        self.invoice_company_a.with_context(
+            default_partner_shipping_id=self.child_partner_company_b.id
+        ).with_user(self.user_company_a.id).action_post()
+        invoice = self.account_move_obj.with_user(self.user_company_b.id).search(
+            [("auto_invoice_id", "=", self.invoice_company_a.id)]
+        )
+        self.assertEqual(invoice.partner_shipping_id, self.partner_company_a)
+
     def test_confirm_invoice_with_native_product_rule_and_shared_product(self):
         """With native security rule, products with access in both companies
         must be present in parent and child invoices.
