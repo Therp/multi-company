@@ -147,7 +147,11 @@ class AccountMove(models.Model):
         :rtype dest_company : res.company record
         """
         self.ensure_one()
-        self = self.with_context(check_move_validity=False)
+        # drop default_* keys (e.g. from sale's action_view_invoice), they
+        # would otherwise end up on the destination invoice
+        self = self.with_context(
+            clean_context(self.env.context), check_move_validity=False
+        )
         # check intercompany product
         self._check_intercompany_product(dest_company)
         # if an invoice has already been generated
@@ -256,15 +260,6 @@ class AccountMove(models.Model):
             "auto_invoice_id": self.id,
             "auto_generated": True,
         }
-        # CHECK ME: This field is created by module sale, maybe we need add dependency?
-        if (
-            hasattr(self, "partner_shipping_id")
-            and self.partner_shipping_id
-            and not self.partner_shipping_id.company_id
-        ):
-            # if shipping partner is shared you may want to propagate its value
-            # to supplier invoice allowing to analyse invoices
-            vals["partner_shipping_id"] = self.partner_shipping_id.id
         return vals
 
     def button_draft(self):
